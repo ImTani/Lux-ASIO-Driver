@@ -17,6 +17,8 @@ add_library(lux_asio SHARED
     src/lux_asio.cpp
     src/dllmain.cpp
     src/lux_asio.def
+    src/wasapi_backend.cpp
+    src/audio_thread.cpp
     external/asiosdk/common/asiodrvr.cpp
     external/asiosdk/common/combase.cpp
     external/asiosdk/common/dllentry.cpp
@@ -29,4 +31,5 @@ target_link_libraries(lux_asio PRIVATE
     uuid
     advapi32
     user32
+    avrt
 )

@@ -1,24 +1,26 @@
 #pragma once
-#include <windows.h>
+#include <initguid.h>
 #include "asiodrvr.h"
+#include "wasapi_backend.h"
+#include "audio_thread.h"
 
-// CLSID for Lux ASIO Driver: {E1A4D078-4925-4C3D-B7E5-3A83FDF0A889}
+// {B9721DFB-6832-4752-B6CD-369F9DF4E383}
 DEFINE_GUID(CLSID_LuxAsioDriver, 
-    0xe1a4d078, 0x4925, 0x4c3d, 0xb7, 0xe5, 0x3a, 0x83, 0xfd, 0xf0, 0xa8, 0x89);
+0xb9721dfb, 0x6832, 0x4752, 0xb6, 0xcd, 0x36, 0x9f, 0x9d, 0xf4, 0xe3, 0x83);
 
-class LuxAsioDriver : public CAsioDriver
+class LuxAsioDriver : public AsioDriver
 {
 public:
     LuxAsioDriver(LPUNKNOWN pUnk, HRESULT *phr);
-    virtual ~LuxAsioDriver();
+    ~LuxAsioDriver();
 
-    static CUnknown * WINAPI CreateInstance(LPUNKNOWN pUnk, HRESULT *phr);
+    static CUnknown* CreateInstance(LPUNKNOWN pUnk, HRESULT *phr);
 
-    virtual ASIOBool init(void *sysRef) override;
+    // ASIO Interface Overrides
+    virtual ASIOBool init(void* sysRef) override;
     virtual void getDriverName(char *name) override;
     virtual long getDriverVersion() override;
     virtual void getErrorMessage(char *string) override;
-
     virtual ASIOError start() override;
     virtual ASIOError stop() override;
     virtual ASIOError getChannels(long *numInputChannels, long *numOutputChannels) override;
@@ -39,10 +41,17 @@ public:
 
 private:
     bool m_active;
+    bool m_buffersCreated;
     ASIOSampleRate m_sampleRate;
-    long m_bufferSize;
     ASIOCallbacks* m_callbacks;
+    
+    WasapiBackend* m_backend;
+    AudioThread* m_audioThread;
+    
     ASIOBufferInfo* m_bufferInfos;
+    long m_bufferSize;
+    
     long m_numInputs;
     long m_numOutputs;
+    HWND m_sysRef;
 };
