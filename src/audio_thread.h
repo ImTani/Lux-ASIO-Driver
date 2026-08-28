@@ -21,6 +21,9 @@ private:
     static DWORD WINAPI ThreadProc(LPVOID lpParam);
     void Run();
 
+    static DWORD WINAPI AsioThreadProc(LPVOID lpParam);
+    void RunAsioThread();
+
     // Zero-overhead aligned mode: WASAPI period == ASIO buffer, no ring buffer needed
     void RunAligned(
         ComPtr<IAudioRenderClient>& renderClient,
@@ -38,6 +41,8 @@ private:
     WasapiBackend* m_backend;
     HANDLE m_threadHandle;
     HANDLE m_eventHandle;
+    HANDLE m_asioThreadHandle;
+    HANDLE m_asioEventHandle;
     std::atomic<bool> m_stopRequested;
 
     long m_bufferSize;       // ASIO block size (user selected)

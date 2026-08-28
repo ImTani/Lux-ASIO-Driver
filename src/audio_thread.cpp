@@ -18,6 +18,8 @@ AudioThread::AudioThread(WasapiBackend* backend)
     , m_numOutputChannels(0)
     , m_asioBufferIndex(0)
     , m_underrunCount(0)
+    , m_asioThreadHandle(NULL)
+    , m_asioEventHandle(NULL)
 {
 }
 
@@ -63,9 +65,9 @@ bool AudioThread::Start(long bufferSize, ASIOCallbacks* callbacks, ASIOBufferInf
 
         for (int i = 0; i < m_numOutputChannels; ++i) {
             auto rb = new RingBuffer(ringSize);
-            // Pre-fill output ring with enough silence to survive until the input ring fills up.
-            // If m_bufferSize > m_wasapiPeriod, we need at least m_bufferSize of pre-fill.
-            size_t prefill = (size_t)((std::max)(m_wasapiPeriod, m_bufferSize));
+            // Pre-fill output ring to the target depth so we start safely ahead of WASAPI.
+            size_t prefill = (size_t)(m_bufferSize * 2);
+            if (prefill < (size_t)m_wasapiPeriod * 4) prefill = (size_t)m_wasapiPeriod * 4;
             rb->PushSilence(prefill);
             m_outputRings.push_back(rb);
         }
@@ -76,6 +78,21 @@ bool AudioThread::Start(long bufferSize, ASIOCallbacks* callbacks, ASIOBufferInf
         CloseHandle(m_eventHandle);
         m_eventHandle = NULL;
         return false;
+    }
+
+    if (!m_alignedMode) {
+        m_asioEventHandle = CreateEvent(NULL, FALSE, FALSE, NULL);
+        if (!m_asioEventHandle) {
+            Stop();
+            return false;
+        }
+
+        m_asioThreadHandle = CreateThread(NULL, 0, AsioThreadProc, this, 0, NULL);
+        if (!m_asioThreadHandle) {
+            Stop();
+            return false;
+        }
+        SetThreadPriority(m_asioThreadHandle, THREAD_PRIORITY_TIME_CRITICAL);
     }
 
     SetThreadPriority(m_threadHandle, THREAD_PRIORITY_TIME_CRITICAL);
@@ -101,10 +118,19 @@ void AudioThread::Stop()
     if (m_eventHandle)
         SetEvent(m_eventHandle);
 
+    if (m_asioEventHandle)
+        SetEvent(m_asioEventHandle);
+
     if (m_threadHandle) {
         WaitForSingleObject(m_threadHandle, INFINITE);
         CloseHandle(m_threadHandle);
         m_threadHandle = NULL;
+    }
+
+    if (m_asioThreadHandle) {
+        WaitForSingleObject(m_asioThreadHandle, INFINITE);
+        CloseHandle(m_asioThreadHandle);
+        m_asioThreadHandle = NULL;
     }
 
     if (m_backend)
@@ -113,6 +139,11 @@ void AudioThread::Stop()
     if (m_eventHandle) {
         CloseHandle(m_eventHandle);
         m_eventHandle = NULL;
+    }
+
+    if (m_asioEventHandle) {
+        CloseHandle(m_asioEventHandle);
+        m_asioEventHandle = NULL;
     }
 
     for (auto rb : m_inputRings)  delete rb;
@@ -125,6 +156,13 @@ DWORD WINAPI AudioThread::ThreadProc(LPVOID lpParam)
 {
     AudioThread* self = static_cast<AudioThread*>(lpParam);
     self->Run();
+    return 0;
+}
+
+DWORD WINAPI AudioThread::AsioThreadProc(LPVOID lpParam)
+{
+    AudioThread* self = static_cast<AudioThread*>(lpParam);
+    self->RunAsioThread();
     return 0;
 }
 
@@ -291,47 +329,10 @@ void AudioThread::RunDecoupled(
                 m_inputRings[c]->PushSilence(availableFrames);
         }
 
-        // --- 2. ASIO Processing: Paced Rendering ---
-        bool canProcess = true;
-        // The output ring only needs to hold enough data to satisfy WASAPI's immediate read (availableFrames).
-        // By breaking early, we process exactly one DAW block when needed, spreading CPU load perfectly.
-        size_t targetDepth = (size_t)availableFrames;
-
-        while (canProcess) {
-            // Check if we already have enough data in the output ring to safely survive
-            if (m_numOutputChannels > 0 && !m_outputRings.empty()) {
-                if (m_outputRings[0]->GetAvailableRead() >= targetDepth) {
-                    canProcess = false; 
-                    break;
-                }
-            }
-
-            if (m_numInputChannels > 0 && !m_inputRings.empty()) {
-                if (m_inputRings[0]->GetAvailableRead() < (size_t)m_bufferSize) {
-                    canProcess = false; break;
-                }
-            }
-            if (m_numOutputChannels > 0 && !m_outputRings.empty()) {
-                if (m_outputRings[0]->GetAvailableWrite() < (size_t)m_bufferSize) {
-                    canProcess = false; break;
-                }
-            }
-
-            for (int c = 0; c < m_numInputChannels; ++c) {
-                float* dest = reinterpret_cast<float*>(m_bufferInfos[c].buffers[m_asioBufferIndex]);
-                m_inputRings[c]->Pop(dest, m_bufferSize);
-            }
-
-            if (m_callbacks && m_callbacks->bufferSwitch)
-                m_callbacks->bufferSwitch(m_asioBufferIndex, ASIOFalse);
-
-            for (int c = 0; c < m_numOutputChannels; ++c) {
-                float* src = reinterpret_cast<float*>(
-                    m_bufferInfos[m_numInputChannels + c].buffers[m_asioBufferIndex]);
-                m_outputRings[c]->Push(src, m_bufferSize);
-            }
-
-            m_asioBufferIndex = m_asioBufferIndex == 0 ? 1 : 0;
+        // --- 2. Wake ASIO Thread ---
+        // We do NOT block or process ASIO here. The WASAPI thread must return instantly.
+        if (m_asioEventHandle) {
+            SetEvent(m_asioEventHandle);
         }
 
         // --- 3. Output Rings → WASAPI (with underrun protection) ---
@@ -367,5 +368,62 @@ void AudioThread::RunDecoupled(
                 renderClient->ReleaseBuffer(availableFrames, 0);
             }
         }
+    }
+}
+
+void AudioThread::RunAsioThread()
+{
+    DWORD taskIndex = 0;
+    HANDLE mmcssHandle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+
+    while (!m_stopRequested) {
+        DWORD waitResult = WaitForSingleObject(m_asioEventHandle, 2000);
+        if (m_stopRequested) break;
+        if (waitResult != WAIT_OBJECT_0) continue;
+
+        bool canProcess = true;
+        // Since this thread is completely decoupled from WASAPI, it can safely take the time
+        // needed to render large buffers. We keep the output ring filled to targetDepth.
+        size_t targetDepth = (size_t)(m_bufferSize * 2);
+        if (targetDepth < (size_t)m_wasapiPeriod * 4) targetDepth = (size_t)m_wasapiPeriod * 4;
+
+        while (canProcess && !m_stopRequested) {
+            if (m_numOutputChannels > 0 && !m_outputRings.empty()) {
+                if (m_outputRings[0]->GetAvailableRead() >= targetDepth) {
+                    canProcess = false; break;
+                }
+            }
+
+            if (m_numInputChannels > 0 && !m_inputRings.empty()) {
+                if (m_inputRings[0]->GetAvailableRead() < (size_t)m_bufferSize) {
+                    canProcess = false; break;
+                }
+            }
+            if (m_numOutputChannels > 0 && !m_outputRings.empty()) {
+                if (m_outputRings[0]->GetAvailableWrite() < (size_t)m_bufferSize) {
+                    canProcess = false; break;
+                }
+            }
+
+            for (int c = 0; c < m_numInputChannels; ++c) {
+                float* dest = reinterpret_cast<float*>(m_bufferInfos[c].buffers[m_asioBufferIndex]);
+                m_inputRings[c]->Pop(dest, m_bufferSize);
+            }
+
+            if (m_callbacks && m_callbacks->bufferSwitch)
+                m_callbacks->bufferSwitch(m_asioBufferIndex, ASIOFalse);
+
+            for (int c = 0; c < m_numOutputChannels; ++c) {
+                float* src = reinterpret_cast<float*>(
+                    m_bufferInfos[m_numInputChannels + c].buffers[m_asioBufferIndex]);
+                m_outputRings[c]->Push(src, m_bufferSize);
+            }
+
+            m_asioBufferIndex = m_asioBufferIndex == 0 ? 1 : 0;
+        }
+    }
+
+    if (mmcssHandle) {
+        AvRevertMmThreadCharacteristics(mmcssHandle);
     }
 }

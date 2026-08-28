@@ -130,29 +130,13 @@ ASIOError LuxAsioDriver::getBufferSize(long *minSize, long *maxSize, long *prefe
     // Query hardware caps so we can report hardware-valid granularity to the DAW.
     // The DAW will snap buffer size choices to multiples of granularity,
     // ensuring aligned mode is achievable.
-    WasapiBufferSizes hwSizes;
-    long fundamental = 0;
-    long hwMin = 64;
-    long hwMax = 2048;
-    if (m_backend->GetBufferSizes(hwSizes)) {
-        fundamental = hwSizes.fundamentalPeriodInFrames;
-        hwMin = (hwSizes.minPeriodInFrames > 0) ? hwSizes.minPeriodInFrames : 64;
-        // Don't artificially restrict the DAW's max size to the hardware's max period,
-        // because we support decoupled ring-buffer mode for large ASIO buffers.
-        hwMax = (hwSizes.maxPeriodInFrames > 4096) ? hwSizes.maxPeriodInFrames : 4096;
-    }
-
-    if (minSize)       *minSize       = hwMin;
-    if (maxSize)       *maxSize       = hwMax;
+    // We ignore hwMin for the DAW, because our ring-buffer architecture supports
+    // any buffer size. We strictly use min=16 and gran=16 so Ableton natively 
+    // accepts sizes like 480, 960, 1440, 1920 without power-of-2 snapping.
+    if (minSize)       *minSize       = 16;
+    if (maxSize)       *maxSize       = 8192;
     if (preferredSize) *preferredSize = m_preferredBufferSize;
-    
-    // Granularity: use the hardware fundamental or a safe fallback so any valid selection 
-    // is hardware-aligned and the DAW does not snap sizes to power-of-2 (which happens if -1).
-    long granularityStep = fundamental;
-    if (granularityStep <= 0) {
-        granularityStep = (hwMin > 0) ? hwMin : 256; 
-    }
-    if (granularity) *granularity = granularityStep;
+    if (granularity)   *granularity   = 16;
     
     return ASE_OK;
 }
