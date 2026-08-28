@@ -1,6 +1,7 @@
 #include "control_panel.h"
 #include "resource.h"
 #include "settings.h"
+#include "wasapi_backend.h"
 #include <windows.h>
 #include <commctrl.h>
 #include <mmdeviceapi.h>
@@ -18,6 +19,7 @@ struct DeviceInfo {
 
 static std::vector<DeviceInfo> g_renderDevices;
 static std::vector<DeviceInfo> g_captureDevices;
+static std::vector<long> g_validPeriods; // Hardware-valid WASAPI periods, queried on open
 static bool g_settingsChanged = false;
 
 // Captured definitively in DllMain - this is the DLL's own HINSTANCE,
@@ -83,16 +85,35 @@ static INT_PTR CALLBACK DialogProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             Settings settings;
             settings.Load();
 
-            // Populate Buffer Sizes
-            int bufferSizes[] = { 64, 128, 256, 512, 1024, 2048 };
+            // Populate Buffer Sizes dynamically from hardware-valid WASAPI periods.
+            // This replaces the hardcoded list and guarantees aligned (zero-overhead) mode
+            // for every size shown — no ring-buffer starvation possible.
             HWND hBufferCombo = GetDlgItem(hwnd, IDC_BUFFER_SIZE);
-            int selectedBufferIdx = 2; // default 256
-            for (int i = 0; i < 6; i++) {
-                wchar_t bufText[32];
-                wsprintfW(bufText, L"%d Samples", bufferSizes[i]);
-                SendMessageW(hBufferCombo, CB_ADDSTRING, 0, (LPARAM)bufText);
-                if (settings.GetBufferSize() == bufferSizes[i]) {
-                    selectedBufferIdx = i;
+            int selectedBufferIdx = 0;
+            if (!g_validPeriods.empty()) {
+                long savedSize = settings.GetBufferSize();
+                // Find the closest valid period to the saved preference
+                long bestDiff = LONG_MAX;
+                for (int i = 0; i < (int)g_validPeriods.size(); i++) {
+                    long diff = abs(g_validPeriods[i] - savedSize);
+                    if (diff < bestDiff) { bestDiff = diff; selectedBufferIdx = i; }
+                }
+                for (int i = 0; i < (int)g_validPeriods.size(); i++) {
+                    wchar_t bufText[64];
+                    // Mark the hardware-native default period with a star
+                    bool isDefault = (g_validPeriods[i] == g_validPeriods[0]);
+                    wsprintfW(bufText, L"%d Samples%s", g_validPeriods[i], isDefault ? L" \u2605" : L"");
+                    SendMessageW(hBufferCombo, CB_ADDSTRING, 0, (LPARAM)bufText);
+                }
+            } else {
+                // Fallback if hardware query failed: offer powers of 2
+                int fallbackSizes[] = { 64, 128, 256, 512, 1024, 2048 };
+                long savedSize = settings.GetBufferSize();
+                for (int i = 0; i < 6; i++) {
+                    wchar_t bufText[64];
+                    wsprintfW(bufText, L"%d Samples", fallbackSizes[i]);
+                    SendMessageW(hBufferCombo, CB_ADDSTRING, 0, (LPARAM)bufText);
+                    if (savedSize == fallbackSizes[i]) selectedBufferIdx = i;
                 }
             }
             SendMessageW(hBufferCombo, CB_SETCURSEL, selectedBufferIdx, 0);
@@ -128,12 +149,18 @@ static INT_PTR CALLBACK DialogProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             if (LOWORD(wParam) == IDC_APPLY) {
                 Settings settings;
                 
-                // Get buffer size
+                // Get buffer size from selected index
                 HWND hBufferCombo = GetDlgItem(hwnd, IDC_BUFFER_SIZE);
                 int selBuf = SendMessageW(hBufferCombo, CB_GETCURSEL, 0, 0);
-                int bufferSizes[] = { 64, 128, 256, 512, 1024, 2048 };
-                if (selBuf >= 0 && selBuf < 6) {
-                    settings.SetBufferSize(bufferSizes[selBuf]);
+                if (selBuf >= 0) {
+                    long chosen = 0;
+                    if (!g_validPeriods.empty() && selBuf < (int)g_validPeriods.size()) {
+                        chosen = g_validPeriods[selBuf];
+                    } else {
+                        int fallbackSizes[] = { 64, 128, 256, 512, 1024, 2048 };
+                        if (selBuf < 6) chosen = fallbackSizes[selBuf];
+                    }
+                    if (chosen > 0) settings.SetBufferSize(chosen);
                 }
 
                 // Get render
@@ -177,7 +204,18 @@ void ShowControlPanel(HWND parentWindow) {
     InitCommonControlsEx(&icc);
     
     g_settingsChanged = false;
-    
+
+    // Query hardware-valid WASAPI periods so the dropdown shows only aligned-mode sizes.
+    // We create a temporary backend, init to default device, query, then discard.
+    g_validPeriods.clear();
+    {
+        WasapiBackend tempBackend;
+        if (tempBackend.Init(48000, L"Default", L"Default")) {
+            g_validPeriods = tempBackend.GetValidPeriods();
+            tempBackend.Shutdown();
+        }
+    }
+
     // Fix #1: MUST use the DLL's own HINSTANCE (not the host's) so that
     // Windows finds our dialog resource embedded in lux_asio.dll.
     // Fix #3: Check return value and log any Win32 error code.

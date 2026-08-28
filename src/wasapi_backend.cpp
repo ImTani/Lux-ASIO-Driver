@@ -4,6 +4,7 @@
 WasapiBackend::WasapiBackend()
     : m_initialized(false)
     , m_sampleRate(44100)
+    , m_negotiatedPeriodInFrames(0)
     , m_renderFormat(nullptr)
     , m_captureFormat(nullptr)
 {
@@ -31,7 +32,7 @@ bool WasapiBackend::Init(long sampleRate, const std::wstring& renderId, const st
         hr = m_deviceEnumerator->GetDevice(renderId.c_str(), &m_renderDevice);
         if (FAILED(hr)) m_deviceEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &m_renderDevice);
     }
-    
+
     if (m_renderDevice) {
         hr = m_renderDevice->Activate(__uuidof(IAudioClient3), CLSCTX_ALL, NULL, (void**)&m_renderAudioClient);
         if (SUCCEEDED(hr)) {
@@ -46,7 +47,7 @@ bool WasapiBackend::Init(long sampleRate, const std::wstring& renderId, const st
     } else {
         hr = m_deviceEnumerator->GetDevice(captureId.c_str(), &m_captureDevice);
     }
-    
+
     if (m_captureDevice) {
         hr = m_captureDevice->Activate(__uuidof(IAudioClient3), CLSCTX_ALL, NULL, (void**)&m_captureAudioClient);
         if (SUCCEEDED(hr)) {
@@ -78,6 +79,7 @@ void WasapiBackend::Shutdown()
     m_deviceEnumerator.Reset();
 
     m_initialized = false;
+    m_negotiatedPeriodInFrames = 0;
 }
 
 bool WasapiBackend::GetBufferSizes(WasapiBufferSizes& outSizes)
@@ -85,40 +87,137 @@ bool WasapiBackend::GetBufferSizes(WasapiBufferSizes& outSizes)
     if (!m_renderAudioClient) return false;
 
     UINT32 defaultPeriod, fundamentalPeriod, minPeriod, maxPeriod;
-    
-    // We request periods based on the mix format. The driver will try to match this format.
-    HRESULT hr = m_renderAudioClient->GetSharedModeEnginePeriod(m_renderFormat, &defaultPeriod, &fundamentalPeriod, &minPeriod, &maxPeriod);
-    
+    HRESULT hr = m_renderAudioClient->GetSharedModeEnginePeriod(
+        m_renderFormat, &defaultPeriod, &fundamentalPeriod, &minPeriod, &maxPeriod);
+
     if (FAILED(hr)) {
-        // Fallback if IAudioClient3 period query fails for some reason
-        outSizes.defaultPeriodInFrames = 256;
-        outSizes.fundamentalPeriodInFrames = 0;
-        outSizes.minPeriodInFrames = 256;
-        outSizes.maxPeriodInFrames = 256;
+        // Fallback for pre-Win10-1703 or drivers that don't support IAudioClient3 period query
+        outSizes.defaultPeriodInFrames   = 480;
+        outSizes.fundamentalPeriodInFrames = 480;
+        outSizes.minPeriodInFrames       = 480;
+        outSizes.maxPeriodInFrames       = 480;
         return true;
     }
 
-    outSizes.defaultPeriodInFrames = defaultPeriod;
-    outSizes.fundamentalPeriodInFrames = fundamentalPeriod;
-    outSizes.minPeriodInFrames = minPeriod;
-    outSizes.maxPeriodInFrames = maxPeriod;
+    outSizes.defaultPeriodInFrames     = static_cast<long>(defaultPeriod);
+    outSizes.fundamentalPeriodInFrames = static_cast<long>(fundamentalPeriod);
+    outSizes.minPeriodInFrames         = static_cast<long>(minPeriod);
+    outSizes.maxPeriodInFrames         = static_cast<long>(maxPeriod);
     return true;
 }
 
-bool WasapiBackend::InitStreams(long bufferSizeInFrames, HANDLE eventHandle)
+bool WasapiBackend::TryNegotiatePeriod(long requestedFrames, long& outActualFrames)
+{
+    WasapiBufferSizes sizes;
+    if (!GetBufferSizes(sizes)) {
+        outActualFrames = requestedFrames;
+        return false;
+    }
+
+    long fundamental = sizes.fundamentalPeriodInFrames;
+    long minP = sizes.minPeriodInFrames;
+    long maxP = sizes.maxPeriodInFrames;
+
+    if (fundamental <= 0) {
+        // Driver doesn't expose fundamental — just clamp and use as-is
+        outActualFrames = (requestedFrames < minP) ? minP :
+                          (requestedFrames > maxP) ? maxP : requestedFrames;
+        return true;
+    }
+
+    // Snap to nearest valid multiple of fundamental within [min, max]
+    // Valid period = N * fundamental, N >= ceil(minP / fundamental)
+    long nMin = (minP + fundamental - 1) / fundamental; // ceil
+    long nMax = maxP / fundamental;                      // floor
+
+    // Find the N whose N*fundamental is closest to requestedFrames
+    long nRequested = (requestedFrames + fundamental / 2) / fundamental; // round
+    long n = (nRequested < nMin) ? nMin :
+             (nRequested > nMax) ? nMax : nRequested;
+
+    outActualFrames = n * fundamental;
+
+    char dbgMsg[256];
+    sprintf_s(dbgMsg, "[LuxASIO] TryNegotiatePeriod: requested=%ld, fundamental=%ld, snap->%ld (N=%ld)\n",
+              requestedFrames, fundamental, outActualFrames, n);
+    OutputDebugStringA(dbgMsg);
+
+    return true;
+}
+
+std::vector<long> WasapiBackend::GetValidPeriods()
+{
+    std::vector<long> periods;
+
+    WasapiBufferSizes sizes;
+    if (!GetBufferSizes(sizes)) return periods;
+
+    long fundamental = sizes.fundamentalPeriodInFrames;
+    long minP = sizes.minPeriodInFrames;
+    long maxP = sizes.maxPeriodInFrames;
+
+    if (fundamental <= 0 || maxP <= 0) {
+        // Fallback: return the default only
+        periods.push_back(sizes.defaultPeriodInFrames);
+        return periods;
+    }
+
+    // Enumerate all N * fundamental in [minP, min(maxP, 8192)] to keep the list manageable
+    long cap = (maxP < 8192) ? maxP : 8192;
+    for (long p = minP; p <= cap; p += fundamental) {
+        periods.push_back(p);
+    }
+
+    return periods;
+}
+
+bool WasapiBackend::InitStreams(long asioBufferSizeInFrames, HANDLE eventHandle, bool& outAlignedMode)
 {
     if (!m_renderAudioClient) return false;
 
+    // Negotiate the WASAPI period to the user's ASIO buffer size.
+    // If exact match is achievable we get aligned mode; otherwise snap to nearest valid multiple.
+    long wasapiPeriod = 0;
+    TryNegotiatePeriod(asioBufferSizeInFrames, wasapiPeriod);
+    if (wasapiPeriod <= 0) wasapiPeriod = asioBufferSizeInFrames;
+
+    m_negotiatedPeriodInFrames = wasapiPeriod;
+    outAlignedMode = (wasapiPeriod == asioBufferSizeInFrames);
+
+    char dbgMsg[256];
+    sprintf_s(dbgMsg, "[LuxASIO] InitStreams: ASIO=%ld, WASAPI=%ld, mode=%s\n",
+              asioBufferSizeInFrames, wasapiPeriod,
+              outAlignedMode ? "ALIGNED (zero-overhead)" : "FALLBACK (ring buffer)");
+    OutputDebugStringA(dbgMsg);
+
     DWORD flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
 
-    // Initialize Render
+    // --- Render ---
     HRESULT hr = m_renderAudioClient->InitializeSharedAudioStream(
         flags,
-        bufferSizeInFrames,
+        static_cast<UINT32>(wasapiPeriod),
         m_renderFormat,
         NULL
     );
-    if (FAILED(hr)) return false;
+
+    if (FAILED(hr)) {
+        // IAudioClient3::InitializeSharedAudioStream may fail on some virtualized/legacy drivers.
+        // Fall back to the classic IAudioClient::Initialize with a 100ns-unit period.
+        // Convert frames → 100ns: (frames / sampleRate) * 10,000,000
+        REFERENCE_TIME period100ns = (REFERENCE_TIME)wasapiPeriod * 10000000LL / m_sampleRate;
+        hr = m_renderAudioClient->Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            period100ns,
+            0,
+            m_renderFormat,
+            NULL
+        );
+        // If we fell back, we're no longer aligned in the IAudioClient3 sense
+        outAlignedMode = false;
+        OutputDebugStringA("[LuxASIO] InitStreams: InitializeSharedAudioStream failed, using classic Initialize fallback\n");
+        if (FAILED(hr)) return false;
+    }
 
     hr = m_renderAudioClient->SetEventHandle(eventHandle);
     if (FAILED(hr)) return false;
@@ -126,21 +225,30 @@ bool WasapiBackend::InitStreams(long bufferSizeInFrames, HANDLE eventHandle)
     hr = m_renderAudioClient->GetService(IID_PPV_ARGS(&m_renderClient));
     if (FAILED(hr)) return false;
 
-    // Initialize Capture (if available)
+    // --- Capture (optional) ---
     if (m_captureAudioClient && m_captureFormat) {
-        // Try to initialize capture with the same period
-        hr = m_captureAudioClient->InitializeSharedAudioStream(
+        // Try to match capture period to render period for symmetric timing
+        HRESULT hrCap = m_captureAudioClient->InitializeSharedAudioStream(
             flags,
-            bufferSizeInFrames,
+            static_cast<UINT32>(wasapiPeriod),
             m_captureFormat,
             NULL
         );
-        
-        if (SUCCEEDED(hr)) {
-            // Note: Capture stream needs its own event handle if we wait on it,
-            // but in ASIO we typically wait on the render handle and just pull available capture packets.
-            // For IAudioClient3, it's often better to not set the event handle on capture and just poll it
-            // when render event fires, or set the SAME event handle. We'll set the same event handle.
+
+        if (FAILED(hrCap)) {
+            REFERENCE_TIME period100ns = (REFERENCE_TIME)wasapiPeriod * 10000000LL / m_sampleRate;
+            hrCap = m_captureAudioClient->Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                period100ns,
+                0,
+                m_captureFormat,
+                NULL
+            );
+        }
+
+        if (SUCCEEDED(hrCap)) {
+            // In ASIO we drive from render event; set same handle so capture is also pumped.
             m_captureAudioClient->SetEventHandle(eventHandle);
             m_captureAudioClient->GetService(IID_PPV_ARGS(&m_captureClient));
         }

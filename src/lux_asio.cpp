@@ -127,12 +127,26 @@ ASIOError LuxAsioDriver::getLatencies(long *inputLatency, long *outputLatency)
 
 ASIOError LuxAsioDriver::getBufferSize(long *minSize, long *maxSize, long *preferredSize, long *granularity)
 {
-    // Fix #2: Return the user's selected buffer size as preferredSize.
-    // The DAW uses this during re-init to call createBuffers() with the right size.
-    if (minSize)       *minSize       = 64;
-    if (maxSize)       *maxSize       = 2048;
-    if (preferredSize) *preferredSize = m_preferredBufferSize; // NOT a hardcoded 256
-    if (granularity)   *granularity   = -1; // Power of 2 sizes
+    // Query hardware caps so we can report hardware-valid granularity to the DAW.
+    // The DAW will snap buffer size choices to multiples of granularity,
+    // ensuring aligned mode is achievable.
+    WasapiBufferSizes hwSizes;
+    long fundamental = 0;
+    long hwMin = 64;
+    long hwMax = 2048;
+    if (m_backend->GetBufferSizes(hwSizes)) {
+        fundamental = hwSizes.fundamentalPeriodInFrames;
+        hwMin = (hwSizes.minPeriodInFrames > 0) ? hwSizes.minPeriodInFrames : 64;
+        hwMax = (hwSizes.maxPeriodInFrames > 0) ? hwSizes.maxPeriodInFrames : 2048;
+        if (hwMax > 4096) hwMax = 4096; // Cap at 4096 for sanity
+    }
+
+    if (minSize)       *minSize       = hwMin;
+    if (maxSize)       *maxSize       = hwMax;
+    if (preferredSize) *preferredSize = m_preferredBufferSize;
+    // Granularity: use the hardware fundamental so any valid selection is hardware-aligned.
+    // -1 would mean power-of-2 only, but our hardware may use 48-frame fundamentals.
+    if (granularity)   *granularity   = (fundamental > 0) ? (long)fundamental : -1;
     return ASE_OK;
 }
 
