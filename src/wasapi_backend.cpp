@@ -156,15 +156,17 @@ std::vector<long> WasapiBackend::GetValidPeriods()
     long minP = sizes.minPeriodInFrames;
     long maxP = sizes.maxPeriodInFrames;
 
-    if (fundamental <= 0 || maxP <= 0) {
-        // Fallback: return the default only
-        periods.push_back(sizes.defaultPeriodInFrames);
-        return periods;
-    }
+    long step = (fundamental > 0) ? fundamental : ((minP > 0) ? minP : sizes.defaultPeriodInFrames);
+    if (step <= 0) step = 256; // Absolute fallback
+    
+    long start = (minP > 0) ? minP : step;
 
-    // Enumerate all N * fundamental in [minP, min(maxP, 8192)] to keep the list manageable
-    long cap = (maxP < 8192) ? maxP : 8192;
-    for (long p = minP; p <= cap; p += fundamental) {
+    // We want to offer large buffer sizes (for heavy projects) even if the hardware's
+    // max period is restricted (e.g. minP == maxP == 480). The AudioThread handles 
+    // these larger sizes via the decoupled ring-buffer mode.
+    long cap = (maxP > 4096) ? maxP : 4096;
+    
+    for (long p = start; p <= cap; p += step) {
         periods.push_back(p);
     }
 

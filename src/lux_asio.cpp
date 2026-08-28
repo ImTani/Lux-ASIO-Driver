@@ -137,8 +137,9 @@ ASIOError LuxAsioDriver::getBufferSize(long *minSize, long *maxSize, long *prefe
     if (m_backend->GetBufferSizes(hwSizes)) {
         fundamental = hwSizes.fundamentalPeriodInFrames;
         hwMin = (hwSizes.minPeriodInFrames > 0) ? hwSizes.minPeriodInFrames : 64;
-        hwMax = (hwSizes.maxPeriodInFrames > 0) ? hwSizes.maxPeriodInFrames : 2048;
-        if (hwMax > 4096) hwMax = 4096; // Cap at 4096 for sanity
+        // Don't artificially restrict the DAW's max size to the hardware's max period,
+        // because we support decoupled ring-buffer mode for large ASIO buffers.
+        hwMax = (hwSizes.maxPeriodInFrames > 4096) ? hwSizes.maxPeriodInFrames : 4096;
     }
 
     if (minSize)       *minSize       = hwMin;
