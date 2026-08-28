@@ -1,0 +1,26 @@
+# Build artifacts
+build/
+bin/
+obj/
+*.obj
+*.lib
+*.exp
+*.dll
+*.old*
+*.pdb
+*.ilk
+*.tlog
+*.recipe
+*.lastbuildstate
+*.log
+
+# Visual Studio & IDE
+.vs/
+*.sln.docstates
+*.user
+*.suo
+.idea/
+.vscode/
+
+# Temporary files
+*.tmp
