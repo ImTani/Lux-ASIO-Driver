@@ -17,7 +17,8 @@ struct ChannelSlot {
 
 // Device sample layouts the engine can convert to/from. Shared mode is always
 // float32; exclusive mode usually negotiates an integer format.
-enum class SampleFmt { F32, I32, I24_32, I16 };
+// I24P = packed 3-byte frames (common canonical exclusive format on HDA codecs).
+enum class SampleFmt { F32, I32, I24_32, I24P, I16 };
 
 class AudioThread {
 public:

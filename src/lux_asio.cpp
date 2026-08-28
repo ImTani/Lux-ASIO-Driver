@@ -376,14 +376,26 @@ ASIOError LuxAsioDriver::controlPanel()
     // so we must capture it here while the engine is still live.
     ASIOCallbacks* callbacksSnapshot = m_callbacks;
 
-    // Active-backend indicator for the panel: which engine is actually running.
-    wchar_t status[128];
+    // Active-backend indicator for the panel: which engine is actually
+    // running — and, crucially, whether an exclusive request silently fell
+    // back to shared (device rejected every exclusive format).
+    Settings currentSettings;
+    currentSettings.Load();
+    const bool exclusiveRequested = currentSettings.GetExclusiveMode();
+    const bool exclusiveActive = m_backend->IsExclusive();
+
+    wchar_t status[160];
     if (m_active && m_audioThread->IsRunning()) {
-        swprintf_s(status, L"Running: %s %s @ %ld frames — underruns: %ld",
-                   m_backend->IsExclusive() ? L"EXCLUSIVE" : L"SHARED",
+        swprintf_s(status, L"Running: %s %s @ %ld frames — underruns: %ld%s",
+                   exclusiveActive ? L"EXCLUSIVE" : L"SHARED",
                    m_audioThread->IsAligned() ? L"aligned" : L"ring-buffer",
                    m_audioThread->GetStreamPeriod(),
-                   m_audioThread->GetUnderrunCount());
+                   m_audioThread->GetUnderrunCount(),
+                   (exclusiveRequested && !exclusiveActive)
+                       ? L"  (!) exclusive unavailable — device refused, using shared"
+                       : L"");
+    } else if (exclusiveRequested && !exclusiveActive) {
+        swprintf_s(status, L"Engine stopped — (!) exclusive unavailable on this device");
     } else {
         swprintf_s(status, L"Engine stopped");
     }

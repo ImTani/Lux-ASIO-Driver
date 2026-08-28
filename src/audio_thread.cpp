@@ -28,6 +28,7 @@ static SampleFmt DetectSampleFormat(const WAVEFORMATEX* fmt)
 
     if (isFloat) return SampleFmt::F32;
     if (fmt->wBitsPerSample == 16) return SampleFmt::I16;
+    if (fmt->wBitsPerSample == 24) return SampleFmt::I24P;
     if (fmt->wBitsPerSample == 32 && validBits == 24) return SampleFmt::I24_32;
     return SampleFmt::I32;
 }
@@ -57,6 +58,18 @@ static void ConvertFloatToDev(BYTE* dst, const float* src, size_t sampleCount, S
             }
             break;
         }
+        case SampleFmt::I24P: {
+            BYTE* d = dst;
+            for (size_t i = 0; i < sampleCount; ++i) {
+                float v = src[i];
+                v = (v > 1.0f) ? 1.0f : (v < -1.0f) ? -1.0f : v;
+                INT32 s = (INT32)(v * 8388607.0f);
+                d[i * 3 + 0] = (BYTE)(s & 0xFF);
+                d[i * 3 + 1] = (BYTE)((s >> 8) & 0xFF);
+                d[i * 3 + 2] = (BYTE)((s >> 16) & 0xFF);
+            }
+            break;
+        }
         case SampleFmt::I32: {
             INT32* d = reinterpret_cast<INT32*>(dst);
             for (size_t i = 0; i < sampleCount; ++i) {
@@ -77,6 +90,12 @@ static inline float DevSampleToFloat(const BYTE* frameBase, int channel, SampleF
         case SampleFmt::I16:    return reinterpret_cast<const INT16*>(frameBase)[channel] / 32768.0f;
         case SampleFmt::I24_32: return (reinterpret_cast<const INT32*>(frameBase)[channel] >> 8) / 8388608.0f;
         case SampleFmt::I32:    return reinterpret_cast<const INT32*>(frameBase)[channel] / 2147483648.0f;
+        case SampleFmt::I24P: {
+            const BYTE* p = frameBase + channel * 3;
+            INT32 v = (INT32)(p[0] | (p[1] << 8) | (p[2] << 16));
+            if (v & 0x800000) v |= 0xFF000000;
+            return v / 8388608.0f;
+        }
     }
     return 0.0f;
 }

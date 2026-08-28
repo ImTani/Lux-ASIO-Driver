@@ -4,6 +4,11 @@
 #include <ksmedia.h>
 #include <stdio.h>
 
+// {F19F064D-082C-4E27-BC73-6882A1BB8E4C},0 — the device's exclusive-mode
+// "Default Format" (defined locally to avoid INITGUID link ordering issues)
+static const PROPERTYKEY LuxPKEY_AudioEngine_DeviceFormat =
+    { { 0xF19F064D, 0x082C, 0x4E27, { 0xBC, 0x73, 0x68, 0x82, 0xA1, 0xBB, 0x8E, 0x4C } }, 0 };
+
 WasapiBackend::WasapiBackend()
     : m_initialized(false)
     , m_streamsInitialized(false)
@@ -72,8 +77,11 @@ bool WasapiBackend::ResetClients()
     return true;
 }
 
-// Exclusive mode rarely accepts the float32 mix format; probe the common
-// hardware formats in quality order at the mix rate/channel count.
+// Exclusive mode rarely accepts the float32 mix format. Try the device's own
+// canonical exclusive format first (PKEY_AudioEngine_DeviceFormat — the
+// "Default Format" from the Sound control panel, which exclusive-capable
+// codecs are guaranteed to accept), then probe common layouts in quality
+// order at the mix rate/channel count.
 bool WasapiBackend::NegotiateExclusiveFormat()
 {
     if (!m_renderAudioClient || !m_renderFormat) return false;
@@ -83,10 +91,49 @@ bool WasapiBackend::NegotiateExclusiveFormat()
         m_renderExclusiveFormat = nullptr;
     }
 
-    struct Candidate { WORD bits; WORD validBits; bool isFloat; };
+    auto tryFormat = [this](const WAVEFORMATEX* fmt) -> bool {
+        if (!fmt) return false;
+        HRESULT hr = m_renderAudioClient->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE,
+                                                            fmt, NULL);
+        if (hr != S_OK) return false;
+        size_t size = sizeof(WAVEFORMATEX) + fmt->cbSize;
+        m_renderExclusiveFormat = (WAVEFORMATEX*)CoTaskMemAlloc(size);
+        if (!m_renderExclusiveFormat) return false;
+        memcpy(m_renderExclusiveFormat, fmt, size);
+
+        char dbg[128];
+        sprintf_s(dbg, "[LuxASIO] Exclusive format accepted: %u-bit, tag=0x%X, %lu Hz\n",
+                  fmt->wBitsPerSample, fmt->wFormatTag, fmt->nSamplesPerSec);
+        OutputDebugStringA(dbg);
+        return true;
+    };
+
+    // 1) The device's own exclusive-mode format (most reliable path — this is
+    // what fixes machines where every generic candidate is rejected)
+    {
+        Microsoft::WRL::ComPtr<IPropertyStore> props;
+        if (m_renderDevice && SUCCEEDED(m_renderDevice->OpenPropertyStore(STGM_READ, &props))) {
+            PROPVARIANT var;
+            PropVariantInit(&var);
+            if (SUCCEEDED(props->GetValue(LuxPKEY_AudioEngine_DeviceFormat, &var)) &&
+                var.vt == VT_BLOB && var.blob.pBlobData &&
+                var.blob.cbSize >= sizeof(WAVEFORMATEX)) {
+                if (tryFormat((const WAVEFORMATEX*)var.blob.pBlobData)) {
+                    PropVariantClear(&var);
+                    return true;
+                }
+            }
+            PropVariantClear(&var);
+        }
+    }
+
+    // 2) Generic candidates: containerBits/validBits, extensible layout.
+    // Includes packed 24-bit (3-byte), which many HDA codecs require.
+    struct Candidate { WORD containerBits; WORD validBits; bool isFloat; };
     const Candidate candidates[] = {
         { 32, 32, true  },   // float32
         { 32, 24, false },   // int24 in 32-bit container
+        { 24, 24, false },   // packed int24 (3-byte frames)
         { 32, 32, false },   // int32
         { 16, 16, false },   // int16
     };
@@ -96,8 +143,8 @@ bool WasapiBackend::NegotiateExclusiveFormat()
         fmt.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
         fmt.Format.nChannels = m_renderFormat->nChannels;
         fmt.Format.nSamplesPerSec = m_renderFormat->nSamplesPerSec;
-        fmt.Format.wBitsPerSample = c.bits;
-        fmt.Format.nBlockAlign = (WORD)(fmt.Format.nChannels * c.bits / 8);
+        fmt.Format.wBitsPerSample = c.containerBits;
+        fmt.Format.nBlockAlign = (WORD)(fmt.Format.nChannels * c.containerBits / 8);
         fmt.Format.nAvgBytesPerSec = fmt.Format.nSamplesPerSec * fmt.Format.nBlockAlign;
         fmt.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
         fmt.Samples.wValidBitsPerSample = c.validBits;
@@ -105,19 +152,19 @@ bool WasapiBackend::NegotiateExclusiveFormat()
                                                         : (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT);
         fmt.SubFormat = c.isFloat ? KSDATAFORMAT_SUBTYPE_IEEE_FLOAT : KSDATAFORMAT_SUBTYPE_PCM;
 
-        HRESULT hr = m_renderAudioClient->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE,
-                                                            (WAVEFORMATEX*)&fmt, NULL);
-        if (hr == S_OK) {
-            m_renderExclusiveFormat = (WAVEFORMATEX*)CoTaskMemAlloc(sizeof(WAVEFORMATEXTENSIBLE));
-            if (!m_renderExclusiveFormat) return false;
-            memcpy(m_renderExclusiveFormat, &fmt, sizeof(WAVEFORMATEXTENSIBLE));
+        if (tryFormat((const WAVEFORMATEX*)&fmt)) return true;
+    }
 
-            char dbg[128];
-            sprintf_s(dbg, "[LuxASIO] Exclusive format: %u-bit %s (%u valid)\n",
-                      c.bits, c.isFloat ? "float" : "int", c.validBits);
-            OutputDebugStringA(dbg);
-            return true;
-        }
+    // 3) Legacy plain WAVEFORMATEX PCM16 for drivers that reject EXTENSIBLE
+    {
+        WAVEFORMATEX fmt = {};
+        fmt.wFormatTag = WAVE_FORMAT_PCM;
+        fmt.nChannels = m_renderFormat->nChannels;
+        fmt.nSamplesPerSec = m_renderFormat->nSamplesPerSec;
+        fmt.wBitsPerSample = 16;
+        fmt.nBlockAlign = (WORD)(fmt.nChannels * 2);
+        fmt.nAvgBytesPerSec = fmt.nSamplesPerSec * fmt.nBlockAlign;
+        if (tryFormat(&fmt)) return true;
     }
 
     OutputDebugStringA("[LuxASIO] No exclusive-mode format accepted by the device\n");
