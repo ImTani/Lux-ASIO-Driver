@@ -1,0 +1,25 @@
+#include <windows.h>
+#include "resource.h"
+
+// Modern visual styles manifest
+1 24 "LuxAsio.manifest"
+
+IDD_CONTROL_PANEL DIALOGEX 0, 0, 300, 160
+STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Lux ASIO Hardware Setup"
+FONT 9, "Segoe UI"
+BEGIN
+    GROUPBOX        "Hardware Devices", -1, 10, 10, 280, 80
+    LTEXT           "Output Device:", -1, 20, 30, 60, 10
+    COMBOBOX        IDC_RENDER_DEVICE, 80, 28, 200, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    
+    LTEXT           "Input Device:", -1, 20, 55, 60, 10
+    COMBOBOX        IDC_CAPTURE_DEVICE, 80, 53, 200, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    GROUPBOX        "Performance", -1, 10, 100, 280, 45
+    LTEXT           "Buffer Size:", -1, 20, 120, 60, 10
+    COMBOBOX        IDC_BUFFER_SIZE, 80, 118, 100, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    DEFPUSHBUTTON   "Apply", IDC_APPLY, 190, 118, 40, 14
+    PUSHBUTTON      "Cancel", IDC_CANCEL, 240, 118, 40, 14
+END
