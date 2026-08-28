@@ -30,6 +30,7 @@ LuxAsioDriver::LuxAsioDriver(LPUNKNOWN pUnk, HRESULT *phr)
     , m_numInputs(0)
     , m_numOutputs(0)
     , m_sysRef(NULL)
+    , m_preferredBufferSize(256) // Safe default until settings are loaded
 {
     if (phr) {
         *phr = S_OK;
@@ -50,6 +51,12 @@ ASIOBool LuxAsioDriver::init(void* sysRef)
     
     Settings settings;
     settings.Load();
+
+    // Fix #2: Load the user's selected buffer size from registry on every init.
+    // The DAW calls init() again after kAsioResetRequest, so this picks up the new value.
+    m_preferredBufferSize = settings.GetBufferSize();
+    if (m_preferredBufferSize < 64 || m_preferredBufferSize > 2048)
+        m_preferredBufferSize = 256; // Clamp to safe range
 
     if (!m_backend->Init(static_cast<long>(m_sampleRate), settings.GetRenderEndpointId(), settings.GetCaptureEndpointId())) {
         return ASIOFalse;
@@ -120,11 +127,12 @@ ASIOError LuxAsioDriver::getLatencies(long *inputLatency, long *outputLatency)
 
 ASIOError LuxAsioDriver::getBufferSize(long *minSize, long *maxSize, long *preferredSize, long *granularity)
 {
-    // Decoupled from WASAPI: we offer a highly flexible range for the DAW
-    if (minSize) *minSize = 64;
-    if (maxSize) *maxSize = 2048;
-    if (preferredSize) *preferredSize = 256;
-    if (granularity) *granularity = -1; // Power of 2 sizes preferred
+    // Fix #2: Return the user's selected buffer size as preferredSize.
+    // The DAW uses this during re-init to call createBuffers() with the right size.
+    if (minSize)       *minSize       = 64;
+    if (maxSize)       *maxSize       = 2048;
+    if (preferredSize) *preferredSize = m_preferredBufferSize; // NOT a hardcoded 256
+    if (granularity)   *granularity   = -1; // Power of 2 sizes
     return ASE_OK;
 }
 
@@ -207,11 +215,18 @@ ASIOError LuxAsioDriver::getChannelInfo(ASIOChannelInfo *info)
 
 ASIOError LuxAsioDriver::createBuffers(ASIOBufferInfo *bufferInfos, long numChannels, long bufferSize, ASIOCallbacks *callbacks)
 {
-    if (m_buffersCreated) return ASE_InvalidMode;
+    // Fix #4: Allow reallocation — disposeBuffers() is called by the DAW
+    // before createBuffers() during a reset cycle. Guard against double-create
+    // without blocking re-creation after a proper dispose.
+    if (m_buffersCreated) {
+        disposeBuffers();
+    }
 
-    m_callbacks = callbacks;
+    m_callbacks  = callbacks;
     m_bufferInfos = bufferInfos;
-    m_bufferSize = bufferSize;
+    m_bufferSize  = bufferSize;
+    // Keep preferred in sync so getBufferSize() stays consistent post-reset
+    m_preferredBufferSize = bufferSize;
     
     for (int i = 0; i < numChannels; i++) {
         m_bufferInfos[i].buffers[0] = new float[bufferSize];
@@ -247,11 +262,27 @@ ASIOError LuxAsioDriver::disposeBuffers()
 
 ASIOError LuxAsioDriver::controlPanel()
 {
+    // Fix #3: Snapshot the callbacks pointer BEFORE showing the dialog.
+    // disposeBuffers() will null m_callbacks after the reset request fires,
+    // so we must capture it here while the engine is still live.
+    ASIOCallbacks* callbacksSnapshot = m_callbacks;
+
     ShowControlPanel(m_sysRef);
     if (DidSettingsChange()) {
         ClearSettingsChangedFlag();
-        if (m_callbacks && m_callbacks->asioMessage) {
-            m_callbacks->asioMessage(kAsioResetRequest, 0, 0, 0);
+        
+        // Fix #1: Immediately read the new buffer size into our in-memory state
+        // so that the upcoming getBufferSize() call returns the correct value.
+        Settings settings;
+        settings.Load();
+        m_preferredBufferSize = settings.GetBufferSize();
+        if (m_preferredBufferSize < 64 || m_preferredBufferSize > 2048)
+            m_preferredBufferSize = 256;
+
+        // Fix #3: Fire the reset request using the snapshot — not m_callbacks,
+        // which may already be null if the audio thread stopped.
+        if (callbacksSnapshot && callbacksSnapshot->asioMessage) {
+            callbacksSnapshot->asioMessage(kAsioResetRequest, 0, 0, 0);
         }
     }
     return ASE_OK;

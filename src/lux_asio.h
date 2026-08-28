@@ -54,4 +54,5 @@ private:
     long m_numInputs;
     long m_numOutputs;
     HWND m_sysRef;
+    long m_preferredBufferSize; // Persisted user selection from Control Panel
 };
