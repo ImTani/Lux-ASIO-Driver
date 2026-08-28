@@ -82,3 +82,12 @@ target_link_libraries(lux_test_host PRIVATE ole32 uuid)
 # period range — the ground truth for the achievable latency floor per device.
 add_executable(lux_probe_periods tools/probe_periods.cpp)
 target_link_libraries(lux_probe_periods PRIVATE ole32 uuid)
+
+# Loopback latency benchmark (roadmap Phase 1/6): measures the REAL round-trip
+# latency of any ASIO driver via chirp emission + cross-correlation, and
+# compares it against what the driver reports.
+add_executable(lux_latency_bench tools/latency_bench.cpp)
+target_include_directories(lux_latency_bench PRIVATE external/asiosdk/common src)
+target_compile_definitions(lux_latency_bench PRIVATE WINDOWS=1 _WINDOWS=1 WIN32=1)
+target_compile_options(lux_latency_bench PRIVATE $<$<CONFIG:Release>:/O2>)
+target_link_libraries(lux_latency_bench PRIVATE ole32 uuid advapi32 user32)
