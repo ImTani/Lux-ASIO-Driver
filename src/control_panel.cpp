@@ -100,18 +100,19 @@ static INT_PTR CALLBACK DialogProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 }
                 for (int i = 0; i < (int)g_validPeriods.size(); i++) {
                     wchar_t bufText[64];
-                    // Mark the hardware-native default period with a star
-                    bool isDefault = (g_validPeriods[i] == g_validPeriods[0]);
+                    // Mark the hardware-native default period (480 / fundamental) with a star
+                    bool isDefault = (g_validPeriods[i] == 480);
                     wsprintfW(bufText, L"%d Samples%s", g_validPeriods[i], isDefault ? L" \u2605" : L"");
                     SendMessageW(hBufferCombo, CB_ADDSTRING, 0, (LPARAM)bufText);
                 }
             } else {
-                // Fallback if hardware query failed: offer powers of 2
-                int fallbackSizes[] = { 64, 128, 256, 512, 1024, 2048 };
+                // Fallback if hardware query failed: offer 30 to 1920 range
+                int fallbackSizes[] = { 30, 60, 120, 240, 480, 960, 1440, 1920 };
                 long savedSize = settings.GetBufferSize();
-                for (int i = 0; i < 6; i++) {
+                for (int i = 0; i < 8; i++) {
                     wchar_t bufText[64];
-                    wsprintfW(bufText, L"%d Samples", fallbackSizes[i]);
+                    bool isDefault = (fallbackSizes[i] == 480);
+                    wsprintfW(bufText, L"%d Samples%s", fallbackSizes[i], isDefault ? L" \u2605" : L"");
                     SendMessageW(hBufferCombo, CB_ADDSTRING, 0, (LPARAM)bufText);
                     if (savedSize == fallbackSizes[i]) selectedBufferIdx = i;
                 }
@@ -157,8 +158,8 @@ static INT_PTR CALLBACK DialogProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                     if (!g_validPeriods.empty() && selBuf < (int)g_validPeriods.size()) {
                         chosen = g_validPeriods[selBuf];
                     } else {
-                        int fallbackSizes[] = { 64, 128, 256, 512, 1024, 2048 };
-                        if (selBuf < 6) chosen = fallbackSizes[selBuf];
+                        int fallbackSizes[] = { 30, 60, 120, 240, 480, 960, 1440, 1920 };
+                        if (selBuf < 8) chosen = fallbackSizes[selBuf];
                     }
                     if (chosen > 0) settings.SetBufferSize(chosen);
                 }

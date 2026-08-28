@@ -161,13 +161,27 @@ std::vector<long> WasapiBackend::GetValidPeriods()
     
     long start = (minP > 0) ? minP : step;
 
-    // We want to offer large buffer sizes (for heavy projects) even if the hardware's
-    // max period is restricted (e.g. minP == maxP == 480). The AudioThread handles 
-    // these larger sizes via the decoupled ring-buffer mode.
-    long cap = (maxP > 4096) ? maxP : 4096;
+    // Add low-latency sub-periods: 30, 60, 120, 240
+    std::vector<long> lowSizes = { 30, 60, 120, 240 };
+    for (long s : lowSizes) {
+        if (s < start) {
+            periods.push_back(s);
+        }
+    }
+
+    // We cap buffer sizes at 1920 samples. The AudioThread handles these
+    // sizes via the decoupled ring-buffer mode or direct aligned mode.
+    long cap = (maxP > 0 && maxP < 1920) ? 1920 : (maxP > 1920 ? 1920 : 1920);
     
     for (long p = start; p <= cap; p += step) {
-        periods.push_back(p);
+        // Ensure no duplicates
+        bool exists = false;
+        for (long existing : periods) {
+            if (existing == p) { exists = true; break; }
+        }
+        if (!exists) {
+            periods.push_back(p);
+        }
     }
 
     return periods;
