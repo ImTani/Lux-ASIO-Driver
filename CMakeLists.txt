@@ -38,10 +38,12 @@ target_compile_definitions(lux_asio PRIVATE
 )
 
 # Compiler flags for MSVC
+# Note: no /arch:AVX2 (a universal driver must run on any x64 CPU) and no /GS-
+# (stack protection stays on; it costs nothing measurable in this code).
 if(MSVC)
-    # /O2: Optimize for speed, /Oi: intrinsic functions, /GL: whole program optimization, /GS-: disable buffer security check
+    # /O2: Optimize for speed, /Oi: intrinsic functions, /GL: whole program optimization
     target_compile_options(lux_asio PRIVATE
-        $<$<CONFIG:Release>:/O2 /Oi /GL /GS- /arch:AVX2>
+        $<$<CONFIG:Release>:/O2 /Oi /GL>
         /Zc:strictStrings-
     )
     # /LTCG for whole program optimization
@@ -57,3 +59,26 @@ target_link_libraries(lux_asio PRIVATE
     avrt
     comctl32
 )
+
+# ---------------------------------------------------------------------------
+# Test host: loads lux_asio.dll directly (no COM registration needed) and
+# exercises the full ASIO lifecycle — init, buffer creation, start/stop/start,
+# sample position, subset channel sets. Run after building:
+#   build\Release\lux_test_host.exe build\Release\lux_asio.dll
+# ---------------------------------------------------------------------------
+add_executable(lux_test_host tools/test_host.cpp)
+target_include_directories(lux_test_host PRIVATE
+    external/asiosdk/common
+    src
+)
+target_compile_definitions(lux_test_host PRIVATE
+    WINDOWS=1
+    _WINDOWS=1
+    WIN32=1
+)
+target_link_libraries(lux_test_host PRIVATE ole32 uuid)
+
+# Device capability probe: prints each endpoint's IAudioClient3 shared-mode
+# period range — the ground truth for the achievable latency floor per device.
+add_executable(lux_probe_periods tools/probe_periods.cpp)
+target_link_libraries(lux_probe_periods PRIVATE ole32 uuid)
