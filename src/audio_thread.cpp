@@ -63,9 +63,10 @@ bool AudioThread::Start(long bufferSize, ASIOCallbacks* callbacks, ASIOBufferInf
 
         for (int i = 0; i < m_numOutputChannels; ++i) {
             auto rb = new RingBuffer(ringSize);
-            // Pre-fill output ring with 2 full WASAPI periods of silence.
-            // This gives the DAW time to fill it before WASAPI first drains it.
-            rb->PushSilence((size_t)m_wasapiPeriod * 2);
+            // Pre-fill output ring with enough silence to survive until the input ring fills up.
+            // If m_bufferSize > m_wasapiPeriod, we need at least m_bufferSize of pre-fill.
+            size_t prefill = (size_t)((std::max)(m_wasapiPeriod, m_bufferSize));
+            rb->PushSilence(prefill);
             m_outputRings.push_back(rb);
         }
     }
@@ -292,9 +293,9 @@ void AudioThread::RunDecoupled(
 
         // --- 2. ASIO Processing: Paced Rendering ---
         bool canProcess = true;
-        // The output ring should hold enough data to survive WASAPI reads, but not fill to 100%.
-        // By breaking early, we prevent burst-rendering that starves the WASAPI thread.
-        size_t targetDepth = (size_t)((std::max)(m_bufferSize, m_wasapiPeriod)) * 2;
+        // The output ring only needs to hold enough data to satisfy WASAPI's immediate read (availableFrames).
+        // By breaking early, we process exactly one DAW block when needed, spreading CPU load perfectly.
+        size_t targetDepth = (size_t)availableFrames;
 
         while (canProcess) {
             // Check if we already have enough data in the output ring to safely survive
