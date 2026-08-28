@@ -212,6 +212,7 @@ bool AudioThread::Start(long bufferSize, ASIOCallbacks* callbacks,
     m_wakeupCount      = 0;
     m_getBufferFailCount = 0;
     m_minRingDepth     = -1;
+    m_recoveryCount    = 0;
     m_samplePosition   = 0;
     m_systemTimeNs     = 0;
     m_carryFrames      = 0;
@@ -557,10 +558,24 @@ void AudioThread::RunAligned(
     m_renderCarry.assign((size_t)m_bufferSize * renderCh, 0.0f);
     m_carryFrames = 0;
 
+    // Watchdog timeout: exclusive event chains are demand-driven on some
+    // drivers and die permanently if a deadline is missed; recover with
+    // Stop/Reset/Prime/Start (industry consensus). Shared mode keeps the
+    // long timeout — its engine keeps signaling regardless.
+    const DWORD waitMs = m_exclusive
+        ? (DWORD)(std::max)(50.0, 8000.0 * m_wasapiPeriod / m_sampleRate)
+        : 2000;
+
     while (!m_stopRequested) {
-        DWORD waitResult = WaitForSingleObject(m_eventHandle, 2000);
+        DWORD waitResult = WaitForSingleObject(m_eventHandle, waitMs);
         if (m_stopRequested) break;
-        if (waitResult != WAIT_OBJECT_0) continue;
+        if (waitResult != WAIT_OBJECT_0) {
+            if (m_exclusive && waitResult == WAIT_TIMEOUT) {
+                m_recoveryCount.fetch_add(1, std::memory_order_relaxed);
+                m_backend->RecoverRenderStream();
+            }
+            continue;
+        }
         m_wakeupCount.fetch_add(1, std::memory_order_relaxed);
 
         // Exclusive pacing note (do NOT gate writes here): this codec's
@@ -730,10 +745,21 @@ void AudioThread::RunDecoupled(
     std::vector<float> renderInterleaved(16384);
     const int nCh = renderFormat ? renderFormat->nChannels : 2;
 
+    // See RunAligned: exclusive event chains need a watchdog + recovery.
+    const DWORD waitMs = m_exclusive
+        ? (DWORD)(std::max)(50.0, 8000.0 * m_wasapiPeriod / m_sampleRate)
+        : 2000;
+
     while (!m_stopRequested) {
-        DWORD waitResult = WaitForSingleObject(m_eventHandle, 2000);
+        DWORD waitResult = WaitForSingleObject(m_eventHandle, waitMs);
         if (m_stopRequested) break;
-        if (waitResult != WAIT_OBJECT_0) continue;
+        if (waitResult != WAIT_OBJECT_0) {
+            if (m_exclusive && waitResult == WAIT_TIMEOUT) {
+                m_recoveryCount.fetch_add(1, std::memory_order_relaxed);
+                m_backend->RecoverRenderStream();
+            }
+            continue;
+        }
 
         // How many frames can we write to WASAPI right now?
         UINT32 availableFrames = 0;

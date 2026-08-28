@@ -448,6 +448,10 @@ ASIOError LuxAsioDriver::future(long selector, void *opt)
             if (!opt) return ASE_InvalidParameter;
             *(long*)opt = m_audioThread->GetMaxRenderPadding();
             return ASE_SUCCESS;
+        case 0x4C555806: // watchdog stream recoveries since start
+            if (!opt) return ASE_InvalidParameter;
+            *(long*)opt = m_audioThread->GetRecoveryCount();
+            return ASE_SUCCESS;
         default:
             return ASE_NotPresent;
     }

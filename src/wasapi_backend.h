@@ -99,6 +99,12 @@ public:
     // first-event transient where the whole empty buffer is offered at once.
     bool PrimeRenderWithSilence();
 
+    // Missed-event recovery (exclusive mode): the event chain is demand-driven
+    // on some drivers and never recovers by itself once stalled. The industry
+    // consensus (PortAudio, ASIO2WASAPI, CamillaDSP) is Stop -> Reset ->
+    // re-prime -> Start on the render client.
+    bool RecoverRenderStream();
+
     // The actual stream period we negotiated (may differ from the ASIO buffer size in fallback mode)
     long GetNegotiatedPeriod() const { return m_negotiatedPeriodInFrames; }
 

@@ -674,6 +674,19 @@ bool WasapiBackend::GetRenderPlayedFrames(long long& outFrames)
     return true;
 }
 
+bool WasapiBackend::RecoverRenderStream()
+{
+    if (!m_renderAudioClient) return false;
+    m_renderAudioClient->Stop();
+    m_renderAudioClient->Reset();
+    PrimeRenderWithSilence();
+    HRESULT hr = m_renderAudioClient->Start();
+    OutputDebugStringA(SUCCEEDED(hr)
+        ? "[LuxASIO] Render stream recovered (Stop/Reset/Prime/Start)\n"
+        : "[LuxASIO] Render stream recovery FAILED\n");
+    return SUCCEEDED(hr);
+}
+
 bool WasapiBackend::PrimeRenderWithSilence()
 {
     if (!m_renderAudioClient || !m_renderClient) return false;

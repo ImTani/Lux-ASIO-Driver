@@ -37,6 +37,7 @@ public:
     long GetBufferFailCount() const { return m_getBufferFailCount.load(std::memory_order_relaxed); }
     long GetMinRingDepth() const { return m_minRingDepth.load(std::memory_order_relaxed); }
     long GetMaxRenderPadding() const { return m_maxRenderPadding.load(std::memory_order_relaxed); }
+    long GetRecoveryCount() const { return m_recoveryCount.load(std::memory_order_relaxed); }
 
     // Streaming clock for ASIOGetSamplePosition / bufferSwitchTimeInfo
     void GetSamplePosition(long long& samples, long long& systemTimeNs) const {
@@ -156,6 +157,7 @@ private:
     std::atomic<long> m_getBufferFailCount{0};
     std::atomic<long> m_minRingDepth{-1};
     std::atomic<long> m_maxRenderPadding{-1}; // exclusive: device queue depth telemetry
+    std::atomic<long> m_recoveryCount{0};     // watchdog stream recoveries
     std::atomic<long long> m_exclusiveSubmitted{0}; // frames written to the exclusive stream
     long long m_lastExclusiveWriteQpc = 0;          // QPC of the last exclusive write
     long long m_exclusiveMinIntervalQpc = 0;        // 0.75 * period in QPC ticks
