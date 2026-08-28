@@ -145,9 +145,15 @@ ASIOError LuxAsioDriver::getBufferSize(long *minSize, long *maxSize, long *prefe
     if (minSize)       *minSize       = hwMin;
     if (maxSize)       *maxSize       = hwMax;
     if (preferredSize) *preferredSize = m_preferredBufferSize;
-    // Granularity: use the hardware fundamental so any valid selection is hardware-aligned.
-    // -1 would mean power-of-2 only, but our hardware may use 48-frame fundamentals.
-    if (granularity)   *granularity   = (fundamental > 0) ? (long)fundamental : -1;
+    
+    // Granularity: use the hardware fundamental or a safe fallback so any valid selection 
+    // is hardware-aligned and the DAW does not snap sizes to power-of-2 (which happens if -1).
+    long granularityStep = fundamental;
+    if (granularityStep <= 0) {
+        granularityStep = (hwMin > 0) ? hwMin : 256; 
+    }
+    if (granularity) *granularity = granularityStep;
+    
     return ASE_OK;
 }
 

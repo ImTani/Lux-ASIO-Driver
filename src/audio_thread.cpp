@@ -290,9 +290,21 @@ void AudioThread::RunDecoupled(
                 m_inputRings[c]->PushSilence(availableFrames);
         }
 
-        // --- 2. ASIO Processing: fire bufferSwitch as many times as ring holds full blocks ---
+        // --- 2. ASIO Processing: Paced Rendering ---
         bool canProcess = true;
+        // The output ring should hold enough data to survive WASAPI reads, but not fill to 100%.
+        // By breaking early, we prevent burst-rendering that starves the WASAPI thread.
+        size_t targetDepth = (size_t)((std::max)(m_bufferSize, m_wasapiPeriod)) * 2;
+
         while (canProcess) {
+            // Check if we already have enough data in the output ring to safely survive
+            if (m_numOutputChannels > 0 && !m_outputRings.empty()) {
+                if (m_outputRings[0]->GetAvailableRead() >= targetDepth) {
+                    canProcess = false; 
+                    break;
+                }
+            }
+
             if (m_numInputChannels > 0 && !m_inputRings.empty()) {
                 if (m_inputRings[0]->GetAvailableRead() < (size_t)m_bufferSize) {
                     canProcess = false; break;
