@@ -224,6 +224,12 @@ int main(int argc, char** argv) {
         asio->future(0x4C555805, &mpad);
         printf("        diag: wakeups=%ld gbFails=%ld minRing=%ld maxPadding=%ld\n", wk, gbf, mrd, mpad);
     }
+    {
+        long liveIn = 0, liveOut = 0;
+        asio->getLatencies(&liveIn, &liveOut);
+        printf("        live latencies: in=%ld out=%ld frames (%.2f / %.2f ms)\n",
+               liveIn, liveOut, liveIn * 1000.0 / rate, liveOut * 1000.0 / rate);
+    }
 
     // --- stop -> start regression (bug: AUDCLNT_E_ALREADY_INITIALIZED) ----
     Check(asio->stop() == ASE_OK, "T18 stop()");

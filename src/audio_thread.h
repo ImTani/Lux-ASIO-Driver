@@ -159,4 +159,13 @@ private:
     std::atomic<long long> m_exclusiveSubmitted{0}; // frames written to the exclusive stream
     long long m_lastExclusiveWriteQpc = 0;          // QPC of the last exclusive write
     long long m_exclusiveMinIntervalQpc = 0;        // 0.75 * period in QPC ticks
+
+    // Live output-latency measurement for exclusive mode: some codecs demand
+    // ~100 ms of hidden FIFO fill that no API reports. Measured as the steady
+    // submission lead (frames submitted vs wall-clock elapsed) and folded
+    // into the reported latency (host notified via kAsioLatenciesChanged).
+    void MaybeMeasureExclusiveLead();
+    long long m_streamStartQpc = 0;
+    long m_assumedInflight = 0;      // inflight frames assumed by ComputeLatencies
+    bool m_leadMeasured = false;
 };

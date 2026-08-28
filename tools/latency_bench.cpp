@@ -251,8 +251,14 @@ static void ListDrivers() {
 static const PROPERTYKEY BenchPKEY_AudioEngine_DeviceFormat =
     { { 0xF19F064D, 0x082C, 0x4E27, { 0xBC, 0x73, 0x68, 0x82, 0xA1, 0xBB, 0x8E, 0x4C } }, 0 };
 
+// --probe-lead: silent run that measures how far submission runs ahead of the
+// nominal playback timeline (wallclock vs pos/rate). A growing lead is the
+// hidden device FIFO filling; steady lead == its depth. Makes NO sound.
+static bool g_probeLead = false;
+
 static int RunWasapiDirect(bool exclusive, long requestedFrames) {
-    printf("=== WASAPI-DIRECT %s ===\n", exclusive ? "EXCLUSIVE" : "SHARED");
+    printf("=== WASAPI-DIRECT %s%s ===\n", exclusive ? "EXCLUSIVE" : "SHARED",
+           g_probeLead ? " (silent lead probe)" : "");
 
     ComPtr<IMMDeviceEnumerator> en;
     if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, IID_PPV_ARGS(&en))))
@@ -389,6 +395,7 @@ static int RunWasapiDirect(bool exclusive, long requestedFrames) {
     std::atomic<bool> done{false};
 
     auto timelineSample = [&](long long p) -> float {
+        if (g_probeLead) return 0.0f; // silent probe
         for (int i = 0; i < nEmit; ++i) {
             long long off = p - emits[i];
             if (off >= 0 && off < chirpLen) return chirp[(size_t)off];
@@ -412,6 +419,8 @@ static int RunWasapiDirect(bool exclusive, long requestedFrames) {
             pos += renBufFrames;
         }
         ren->Start();
+        double startQPC = renAnchorQPC.load();
+        double lastLeadPrint = 0;
         while (!done.load() && pos < totalFrames) {
             if (WaitForSingleObject(renEvent, 2000) != WAIT_OBJECT_0) continue;
             UINT32 want = (UINT32)streamFrames;
@@ -427,6 +436,16 @@ static int RunWasapiDirect(bool exclusive, long requestedFrames) {
             }
             renSvc->ReleaseBuffer(want, 0);
             pos += want;
+
+            if (g_probeLead) {
+                LARGE_INTEGER q; QueryPerformanceCounter(&q);
+                double wall = (double)q.QuadPart / qpf.QuadPart - startQPC;
+                if (wall - lastLeadPrint >= 0.25) {
+                    lastLeadPrint = wall;
+                    double lead = (pos / rate - wall) * 1000.0;
+                    printf("  t=%.2fs submitted=%lld lead=%+.2f ms\n", wall, pos, lead);
+                }
+            }
         }
         ren->Stop();
         CoUninitialize();
@@ -525,7 +544,9 @@ int main(int argc, char** argv) {
     if (argc >= 3 && strcmp(argv[1], "--wasapi-direct") == 0) {
         CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
         bool excl = (_stricmp(argv[2], "exclusive") == 0 || _stricmp(argv[2], "excl") == 0);
-        long frames = (argc >= 4) ? atol(argv[3]) : 0;
+        long frames = (argc >= 4 && argv[3][0] != '-') ? atol(argv[3]) : 0;
+        for (int i = 3; i < argc; i++)
+            if (strcmp(argv[i], "--probe-lead") == 0) g_probeLead = true;
         int rc = RunWasapiDirect(excl, frames);
         CoUninitialize();
         return rc;

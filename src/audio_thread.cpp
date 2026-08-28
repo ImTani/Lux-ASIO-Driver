@@ -331,12 +331,19 @@ bool AudioThread::Start(long bufferSize, ASIOCallbacks* callbacks,
     long capForLatency = m_alignedMode ? capturePeriod : captureCadence;
     ComputeLatencies(m_bufferSize, m_wasapiPeriod, m_alignedMode, inflight, capForLatency,
                      m_actualInputLatency, m_actualOutputLatency);
+    m_assumedInflight = m_alignedMode ? m_wasapiPeriod : inflight;
+    m_leadMeasured = false;
+    m_streamStartQpc = 0;
     m_latenciesValid.store(true, std::memory_order_release);
 
     if (!m_backend->Start()) {
         Stop();
         return false;
     }
+
+    LARGE_INTEGER startQpc;
+    QueryPerformanceCounter(&startQpc);
+    m_streamStartQpc = startQpc.QuadPart;
 
     char dbgMsg[256];
     sprintf_s(dbgMsg,
@@ -429,6 +436,37 @@ void AudioThread::Run()
 
     if (mmcssHandle)
         AvRevertMmThreadCharacteristics(mmcssHandle);
+}
+
+void AudioThread::MaybeMeasureExclusiveLead()
+{
+    if (m_leadMeasured || !m_exclusive || m_streamStartQpc == 0) return;
+
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double elapsed = (double)(now.QuadPart - m_streamStartQpc) / (double)m_qpcFreq.QuadPart;
+    if (elapsed < 0.5) return; // let the FIFO-fill transient settle
+
+    long long expected = (long long)(elapsed * m_sampleRate);
+    long long lead = m_exclusiveSubmitted.load(std::memory_order_relaxed) - expected;
+    m_leadMeasured = true;
+    if (lead < m_wasapiPeriod) return; // nominal in-flight, nothing hidden
+
+    // Replace the assumed in-flight depth with the measured submission lead
+    long newOut = m_actualOutputLatency - m_assumedInflight + (long)lead;
+    if (newOut > m_actualOutputLatency) {
+        m_actualOutputLatency = newOut;
+
+        char dbg[160];
+        sprintf_s(dbg, "[LuxASIO] Exclusive hidden FIFO measured: lead=%lld frames (%.1f ms); "
+                       "output latency corrected to %ld frames\n",
+                  lead, lead * 1000.0 / m_sampleRate, newOut);
+        OutputDebugStringA(dbg);
+
+        // Tell the host to re-fetch latencies (ASIO 2 supports this at runtime)
+        if (m_callbacks && m_callbacks->asioMessage)
+            m_callbacks->asioMessage(kAsioLatenciesChanged, 0, 0, 0);
+    }
 }
 
 void AudioThread::InvokeBufferSwitch()
@@ -620,6 +658,7 @@ void AudioThread::RunAligned(
                                       (size_t)m_bufferSize * renderCh, m_renderFmt);
                     renderClient->ReleaseBuffer((UINT32)m_bufferSize, 0);
                     m_exclusiveSubmitted.fetch_add(m_bufferSize, std::memory_order_relaxed);
+                    MaybeMeasureExclusiveLead();
                 } else {
                     m_underrunCount.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -779,8 +818,10 @@ void AudioThread::RunDecoupled(
                                       (size_t)availableFrames * nCh, m_renderFmt);
                 }
                 renderClient->ReleaseBuffer(availableFrames, 0);
-                if (m_exclusive)
+                if (m_exclusive) {
                     m_exclusiveSubmitted.fetch_add(availableFrames, std::memory_order_relaxed);
+                    MaybeMeasureExclusiveLead();
+                }
             }
         }
     }
