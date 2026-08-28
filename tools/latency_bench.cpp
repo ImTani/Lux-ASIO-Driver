@@ -19,7 +19,14 @@
 
 #include <windows.h>
 #include <initguid.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#include <mmreg.h>
+#include <ks.h>
+#include <ksmedia.h>
+#include <wrl/client.h>
 #include <atomic>
+#include <thread>
 #include <vector>
 #include <string>
 #include <cmath>
@@ -27,6 +34,8 @@
 #include <algorithm>
 
 #include "iasiodrv.h"
+
+using Microsoft::WRL::ComPtr;
 
 typedef HRESULT (STDAPICALLTYPE *DllGetClassObjectFunc)(REFCLSID, REFIID, void**);
 
@@ -233,7 +242,298 @@ static void ListDrivers() {
 }
 
 // ---------------------------------------------------------------------------
+// WASAPI-direct reference measurement: no ASIO layer at all. Renders the
+// chirp timeline straight through IAudioClient3 (shared or exclusive) to the
+// default output and captures the default mic, with QPC-anchored timelines on
+// both sides. Whatever this measures is the floor of the OS+hardware+room
+// chain; any ASIO driver's overhead is its measurement minus this reference.
+// ---------------------------------------------------------------------------
+static const PROPERTYKEY BenchPKEY_AudioEngine_DeviceFormat =
+    { { 0xF19F064D, 0x082C, 0x4E27, { 0xBC, 0x73, 0x68, 0x82, 0xA1, 0xBB, 0x8E, 0x4C } }, 0 };
+
+static int RunWasapiDirect(bool exclusive, long requestedFrames) {
+    printf("=== WASAPI-DIRECT %s ===\n", exclusive ? "EXCLUSIVE" : "SHARED");
+
+    ComPtr<IMMDeviceEnumerator> en;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, IID_PPV_ARGS(&en))))
+        return 1;
+
+    ComPtr<IMMDevice> renDev, capDev;
+    if (FAILED(en->GetDefaultAudioEndpoint(eRender, eConsole, &renDev)) ||
+        FAILED(en->GetDefaultAudioEndpoint(eCapture, eConsole, &capDev))) {
+        printf("no default devices\n");
+        return 1;
+    }
+
+    // --- Render setup ------------------------------------------------------
+    ComPtr<IAudioClient3> ren;
+    if (FAILED(renDev->Activate(__uuidof(IAudioClient3), CLSCTX_ALL, NULL, (void**)&ren))) return 1;
+    WAVEFORMATEX* mix = nullptr;
+    ren->GetMixFormat(&mix);
+    if (!mix) return 1;
+    const double rate = mix->nSamplesPerSec;
+    const int renCh = mix->nChannels;
+
+    WAVEFORMATEX* renFmt = mix;                 // shared: mix format (float32)
+    std::vector<BYTE> exFmtStorage;
+    long streamFrames = requestedFrames > 0 ? requestedFrames : 480;
+
+    if (exclusive) {
+        // Device canonical exclusive format, else 24-in-32, else int16
+        bool got = false;
+        ComPtr<IPropertyStore> props;
+        if (SUCCEEDED(renDev->OpenPropertyStore(STGM_READ, &props))) {
+            PROPVARIANT var; PropVariantInit(&var);
+            if (SUCCEEDED(props->GetValue(BenchPKEY_AudioEngine_DeviceFormat, &var)) &&
+                var.vt == VT_BLOB && var.blob.pBlobData && var.blob.cbSize >= sizeof(WAVEFORMATEX)) {
+                auto* f = (WAVEFORMATEX*)var.blob.pBlobData;
+                if (ren->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, f, NULL) == S_OK) {
+                    exFmtStorage.assign((BYTE*)f, (BYTE*)f + sizeof(WAVEFORMATEX) + f->cbSize);
+                    got = true;
+                }
+            }
+            PropVariantClear(&var);
+        }
+        if (!got) { printf("no exclusive format accepted\n"); return 1; }
+        renFmt = (WAVEFORMATEX*)exFmtStorage.data();
+
+        REFERENCE_TIME defP = 0, minP = 0;
+        ren->GetDevicePeriod(&defP, &minP);
+        long minFrames = (long)((double)minP * rate / 1e7 + 0.5);
+        if (streamFrames < minFrames) streamFrames = minFrames;
+        REFERENCE_TIME per = (REFERENCE_TIME)(1e7 * streamFrames / rate + 0.5);
+
+        HRESULT hr = ren->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                     per, per, renFmt, NULL);
+        if (hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
+            UINT32 aligned = 0; ren->GetBufferSize(&aligned);
+            ren.Reset();
+            if (FAILED(renDev->Activate(__uuidof(IAudioClient3), CLSCTX_ALL, NULL, (void**)&ren))) return 1;
+            per = (REFERENCE_TIME)(1e7 * aligned / rate + 0.5);
+            hr = ren->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                 per, per, renFmt, NULL);
+        }
+        if (FAILED(hr)) { printf("exclusive Initialize failed 0x%08lX\n", (unsigned long)hr); return 1; }
+        UINT32 actual = 0; ren->GetBufferSize(&actual);
+        streamFrames = (long)actual;
+    } else {
+        HRESULT hr = ren->InitializeSharedAudioStream(AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                                      (UINT32)streamFrames, mix, NULL);
+        if (FAILED(hr)) { printf("shared Initialize failed 0x%08lX\n", (unsigned long)hr); return 1; }
+    }
+
+    long renType = ASIOSTFloat32LSB;
+    {
+        WORD bits = renFmt->wBitsPerSample, valid = bits;
+        bool flt = (renFmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT);
+        if (renFmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+            auto* e = (WAVEFORMATEXTENSIBLE*)renFmt;
+            flt = (e->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+            if (e->Samples.wValidBitsPerSample) valid = e->Samples.wValidBitsPerSample;
+        }
+        renType = flt ? ASIOSTFloat32LSB
+                : bits == 16 ? ASIOSTInt16LSB
+                : bits == 24 ? ASIOSTInt24LSB
+                : ASIOSTInt32LSB;
+        printf("render: %ld-frame period, %u-bit %s, %d ch @ %.0f Hz\n",
+               streamFrames, bits, flt ? "float" : "int", renCh, rate);
+    }
+
+    HANDLE renEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    ren->SetEventHandle(renEvent);
+    ComPtr<IAudioRenderClient> renSvc;
+    if (FAILED(ren->GetService(IID_PPV_ARGS(&renSvc)))) return 1;
+    UINT32 renBufFrames = 0; ren->GetBufferSize(&renBufFrames);
+
+    // --- Capture setup (always shared) -------------------------------------
+    ComPtr<IAudioClient> cap;
+    if (FAILED(capDev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&cap))) return 1;
+    WAVEFORMATEX* capFmt = nullptr;
+    cap->GetMixFormat(&capFmt);
+    if (!capFmt) return 1;
+    if (FAILED(cap->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                               400000, 0, capFmt, NULL))) {
+        printf("capture Initialize failed\n");
+        return 1;
+    }
+    HANDLE capEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    cap->SetEventHandle(capEvent);
+    ComPtr<IAudioCaptureClient> capSvc;
+    if (FAILED(cap->GetService(IID_PPV_ARGS(&capSvc)))) return 1;
+    const int capCh = capFmt->nChannels;
+    const double capRate = capFmt->nSamplesPerSec;
+
+    // --- Chirp timeline -----------------------------------------------------
+    long chirpLen = (long)(rate * 0.25);
+    std::vector<float> chirp(chirpLen);
+    {
+        double f0 = 400.0, f1 = 8000.0, T = chirpLen / rate;
+        for (long i = 0; i < chirpLen; ++i) {
+            double t = i / rate;
+            double ph = 2.0 * 3.14159265358979 * (f0 * t + (f1 - f0) * t * t / (2.0 * T));
+            double w = 0.5 * (1.0 - cos(2.0 * 3.14159265358979 * i / (chirpLen - 1)));
+            chirp[i] = (float)(0.7 * w * sin(ph));
+        }
+    }
+    const int nEmit = 8;
+    std::vector<long long> emits(nEmit);
+    for (int i = 0; i < nEmit; ++i) emits[i] = (long long)(rate * (0.6 + 0.5 * i));
+    const long long totalFrames = (long long)(rate * 5.5);
+
+    LARGE_INTEGER qpf; QueryPerformanceFrequency(&qpf);
+    std::atomic<double> renAnchorQPC{-1.0};   // seconds; submission time of render sample 0
+    std::atomic<double> capAnchorQPC{-1.0};   // seconds; QPC of capture sample capAnchorPos
+    std::atomic<long long> capAnchorPos{-1};
+    std::vector<float> captured((size_t)(capRate * 8.0), 0.0f);
+    std::atomic<long long> capPos{0};
+    std::atomic<bool> done{false};
+
+    auto timelineSample = [&](long long p) -> float {
+        for (int i = 0; i < nEmit; ++i) {
+            long long off = p - emits[i];
+            if (off >= 0 && off < chirpLen) return chirp[(size_t)off];
+        }
+        return 0.0f;
+    };
+
+    std::thread renThread([&] {
+        CoInitializeEx(NULL, COINIT_MULTITHREADED);
+        long long pos = 0;
+        // Prime one buffer, anchoring the submission clock at sample 0
+        BYTE* p = nullptr;
+        if (SUCCEEDED(renSvc->GetBuffer(renBufFrames, &p))) {
+            LARGE_INTEGER q; QueryPerformanceCounter(&q);
+            renAnchorQPC.store((double)q.QuadPart / qpf.QuadPart);
+            for (UINT32 f = 0; f < renBufFrames; ++f) {
+                float v = timelineSample(pos + f);
+                for (int c = 0; c < renCh; ++c) WriteSample(p, renType, f * renCh + c, v);
+            }
+            renSvc->ReleaseBuffer(renBufFrames, 0);
+            pos += renBufFrames;
+        }
+        ren->Start();
+        while (!done.load() && pos < totalFrames) {
+            if (WaitForSingleObject(renEvent, 2000) != WAIT_OBJECT_0) continue;
+            UINT32 want = (UINT32)streamFrames;
+            if (!exclusive) {
+                UINT32 pad = 0; ren->GetCurrentPadding(&pad);
+                want = (renBufFrames > pad) ? renBufFrames - pad : 0;
+            }
+            if (want == 0) continue;
+            if (FAILED(renSvc->GetBuffer(want, &p))) continue;
+            for (UINT32 f = 0; f < want; ++f) {
+                float v = timelineSample(pos + f);
+                for (int c = 0; c < renCh; ++c) WriteSample(p, renType, f * renCh + c, v);
+            }
+            renSvc->ReleaseBuffer(want, 0);
+            pos += want;
+        }
+        ren->Stop();
+        CoUninitialize();
+    });
+
+    std::thread capThread([&] {
+        CoInitializeEx(NULL, COINIT_MULTITHREADED);
+        cap->Start();
+        while (!done.load()) {
+            if (WaitForSingleObject(capEvent, 2000) != WAIT_OBJECT_0) continue;
+            UINT32 pktLen = 0;
+            while (SUCCEEDED(capSvc->GetNextPacketSize(&pktLen)) && pktLen > 0) {
+                BYTE* data = nullptr; UINT32 frames = 0; DWORD flags = 0;
+                UINT64 devPos = 0, qpcPos = 0;
+                if (FAILED(capSvc->GetBuffer(&data, &frames, &flags, &devPos, &qpcPos))) break;
+                long long base = capPos.load();
+                if (capAnchorPos.load() < 0 && !(flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR)) {
+                    capAnchorQPC.store(qpcPos / 1e7); // 100ns -> seconds
+                    capAnchorPos.store(base);
+                }
+                float* src = (float*)data;
+                for (UINT32 f = 0; f < frames && (size_t)(base + f) < captured.size(); ++f) {
+                    float acc = 0;
+                    for (int c = 0; c < capCh; ++c) acc += src[f * capCh + c];
+                    captured[(size_t)(base + f)] = acc / capCh;
+                }
+                capPos.store(base + frames);
+                capSvc->ReleaseBuffer(frames);
+            }
+        }
+        cap->Stop();
+        CoUninitialize();
+    });
+
+    // Wait for the render timeline to finish plus tail
+    while (renAnchorQPC.load() < 0) Sleep(10);
+    Sleep((DWORD)(totalFrames / rate * 1000.0) + 800);
+    done = true;
+    SetEvent(renEvent); SetEvent(capEvent);
+    renThread.join(); capThread.join();
+
+    // --- Analysis: QPC-anchored correlation --------------------------------
+    double renA = renAnchorQPC.load(), capA = capAnchorQPC.load();
+    long long capA0 = capAnchorPos.load();
+    if (capA < 0 || capA0 < 0) { printf("no capture anchor\n"); return 2; }
+
+    // Resample-free correlation assumes capRate == rate for the template.
+    double tNorm = 0;
+    for (float v : chirp) tNorm += (double)v * v;
+
+    std::vector<double> rtts;
+    std::vector<double> allRtts;
+    for (long long e : emits) {
+        double emitQPC = renA + e / rate;
+        long long searchBase = capA0 + (long long)((emitQPC - capA) * capRate);
+        long long searchEnd = searchBase + (long long)(capRate * 0.45);
+        if (searchBase < 0) searchBase = 0;
+        if ((size_t)(searchEnd + chirp.size()) > captured.size()) continue;
+
+        double best = 0; long long bestPos = -1;
+        for (long long lag = searchBase; lag < searchEnd; ++lag) {
+            double dot = 0, energy = 1e-12;
+            const float* c = captured.data() + lag;
+            for (size_t i = 0; i < chirp.size(); ++i) {
+                dot += (double)c[i] * chirp[i];
+                energy += (double)c[i] * c[i];
+            }
+            double s = dot / sqrt(energy * tNorm);
+            if (s > best) { best = s; bestPos = lag; }
+        }
+        if (bestPos >= 0) {
+            double rtt = (capA + (bestPos - capA0) / capRate) - emitQPC;
+            allRtts.push_back(rtt * 1000.0);
+            printf("  trial: corr %.3f, rtt %.2f ms\n", best, rtt * 1000.0);
+        }
+    }
+
+    if (!allRtts.empty()) {
+        std::vector<double> s = allRtts;
+        std::sort(s.begin(), s.end());
+        double med = s[s.size() / 2];
+        for (double d : allRtts) if (fabs(d - med) <= 4.0) rtts.push_back(d);
+        if (rtts.size() < (allRtts.size() + 1) / 2) rtts.clear();
+    }
+    if (rtts.empty()) { printf("MEASURED: no consistent chirp detected\n"); return 2; }
+    std::sort(rtts.begin(), rtts.end());
+    printf("MEASURED submission->mic: %.2f ms median (%zu/%d in cluster)\n",
+           rtts[rtts.size() / 2], rtts.size(), nEmit);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+static int AsioMain(int argc, char** argv);
+
 int main(int argc, char** argv) {
+    if (argc >= 3 && strcmp(argv[1], "--wasapi-direct") == 0) {
+        CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+        bool excl = (_stricmp(argv[2], "exclusive") == 0 || _stricmp(argv[2], "excl") == 0);
+        long frames = (argc >= 4) ? atol(argv[3]) : 0;
+        int rc = RunWasapiDirect(excl, frames);
+        CoUninitialize();
+        return rc;
+    }
+    return AsioMain(argc, argv);
+}
+
+static int AsioMain(int argc, char** argv) {
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
     if (argc >= 2 && strcmp(argv[1], "--list") == 0) { ListDrivers(); return 0; }

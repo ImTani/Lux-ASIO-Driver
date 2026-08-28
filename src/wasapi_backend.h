@@ -90,6 +90,11 @@ public:
     // event-driven mode; the engine double-buffers it internally).
     UINT32 GetRenderBufferFrames();
 
+    // Frames the device has actually PLAYED (IAudioClock). The only honest
+    // pacing reference on codecs whose exclusive-mode padding hides a deep
+    // FIFO. Returns false if the clock is unavailable.
+    bool GetRenderPlayedFrames(long long& outFrames);
+
     // Fill the free render-buffer space with silence before Start(). Kills the
     // first-event transient where the whole empty buffer is offered at once.
     bool PrimeRenderWithSilence();
@@ -117,6 +122,8 @@ private:
     ComPtr<IMMDevice> m_renderDevice;
     ComPtr<IAudioClient3> m_renderAudioClient;
     ComPtr<IAudioRenderClient> m_renderClient;
+    ComPtr<IAudioClock> m_renderClock;
+    UINT64 m_renderClockFreq = 0;
     WAVEFORMATEX* m_renderFormat;            // shared mix format (CoTaskMem)
     WAVEFORMATEX* m_renderExclusiveFormat;   // negotiated exclusive format (CoTaskMem)
 

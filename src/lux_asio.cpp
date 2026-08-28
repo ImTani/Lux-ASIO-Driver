@@ -444,6 +444,10 @@ ASIOError LuxAsioDriver::future(long selector, void *opt)
             if (!opt) return ASE_InvalidParameter;
             *(long*)opt = m_audioThread->GetMinRingDepth();
             return ASE_SUCCESS;
+        case 0x4C555805: // max device render padding seen (exclusive telemetry)
+            if (!opt) return ASE_InvalidParameter;
+            *(long*)opt = m_audioThread->GetMaxRenderPadding();
+            return ASE_SUCCESS;
         default:
             return ASE_NotPresent;
     }

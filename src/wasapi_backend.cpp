@@ -32,6 +32,8 @@ bool WasapiBackend::ActivateRenderClient()
     if (!m_renderDevice) return false;
 
     m_renderClient.Reset();
+    m_renderClock.Reset();
+    m_renderClockFreq = 0;
     m_renderAudioClient.Reset();
 
     HRESULT hr = m_renderDevice->Activate(__uuidof(IAudioClient3), CLSCTX_ALL, NULL, (void**)&m_renderAudioClient);
@@ -235,6 +237,8 @@ void WasapiBackend::Shutdown()
     }
 
     m_renderClient.Reset();
+    m_renderClock.Reset();
+    m_renderClockFreq = 0;
     m_captureClient.Reset();
     m_renderAudioClient.Reset();
     m_captureAudioClient.Reset();
@@ -546,6 +550,11 @@ bool WasapiBackend::InitStreams(long asioBufferSizeInFrames, HANDLE eventHandle,
     hr = m_renderAudioClient->GetService(IID_PPV_ARGS(&m_renderClient));
     if (FAILED(hr)) return false;
 
+    // Play-cursor clock for pacing (optional; padding fallback if absent)
+    m_renderClock.Reset();
+    m_renderClockFreq = 0;
+    m_renderAudioClient->GetService(IID_PPV_ARGS(&m_renderClock));
+
     // --- Capture (optional, always shared) ---
     m_captureStreamPeriod = 0;
     if (m_captureAudioClient && m_captureFormat) {
@@ -650,6 +659,19 @@ UINT32 WasapiBackend::GetRenderBufferFrames()
         m_renderAudioClient->GetBufferSize(&frames);
     }
     return frames;
+}
+
+bool WasapiBackend::GetRenderPlayedFrames(long long& outFrames)
+{
+    if (!m_renderClock) return false;
+    if (m_renderClockFreq == 0) {
+        if (FAILED(m_renderClock->GetFrequency(&m_renderClockFreq)) || m_renderClockFreq == 0)
+            return false;
+    }
+    UINT64 pos = 0;
+    if (FAILED(m_renderClock->GetPosition(&pos, NULL))) return false;
+    outFrames = (long long)((double)pos * (double)m_sampleRate / (double)m_renderClockFreq);
+    return true;
 }
 
 bool WasapiBackend::PrimeRenderWithSilence()

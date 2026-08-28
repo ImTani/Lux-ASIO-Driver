@@ -216,6 +216,14 @@ int main(int argc, char** argv) {
     long underruns = ReadUnderruns(asio);
     printf("        underruns: %ld\n", underruns);
     Check(underruns == 0, "T17b zero output underruns during streaming");
+    {
+        long wk = -1, gbf = -1, mrd = -1, mpad = -1;
+        asio->future(0x4C555802, &wk);
+        asio->future(0x4C555803, &gbf);
+        asio->future(0x4C555804, &mrd);
+        asio->future(0x4C555805, &mpad);
+        printf("        diag: wakeups=%ld gbFails=%ld minRing=%ld maxPadding=%ld\n", wk, gbf, mrd, mpad);
+    }
 
     // --- stop -> start regression (bug: AUDCLNT_E_ALREADY_INITIALIZED) ----
     Check(asio->stop() == ASE_OK, "T18 stop()");

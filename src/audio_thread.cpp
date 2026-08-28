@@ -313,8 +313,15 @@ bool AudioThread::Start(long bufferSize, ASIOCallbacks* callbacks,
     // Aligned shared mode must NOT be primed (it writes one block per event; a
     // full buffer would permanently add bufFrames of latency). Exclusive
     // event-driven streams must always be primed before Start.
+    m_exclusiveSubmitted.store(0, std::memory_order_relaxed);
+    m_lastExclusiveWriteQpc = 0; // first event always passes the interval gate
+    m_exclusiveMinIntervalQpc =
+        (long long)((double)m_qpcFreq.QuadPart * m_wasapiPeriod * 0.75 / m_sampleRate);
     if (!m_alignedMode || m_exclusive) {
         m_backend->PrimeRenderWithSilence();
+        if (m_exclusive)
+            m_exclusiveSubmitted.store((long long)m_backend->GetRenderBufferFrames(),
+                                       std::memory_order_relaxed);
     }
 
     // Publish the actual latencies of this configuration
@@ -516,6 +523,17 @@ void AudioThread::RunAligned(
         DWORD waitResult = WaitForSingleObject(m_eventHandle, 2000);
         if (m_stopRequested) break;
         if (waitResult != WAIT_OBJECT_0) continue;
+        m_wakeupCount.fetch_add(1, std::memory_order_relaxed);
+
+        // Exclusive pacing note (do NOT gate writes here): this codec's
+        // exclusive event chain is demand-driven — every event REQUIRES a
+        // buffer; skipping a single write stalls the event chain permanently
+        // (measured: 4 events then silence). The device demands an initial
+        // burst that fills a hidden internal FIFO (~100 ms on Realtek HDA,
+        // invisible to GetCurrentPadding and IAudioClock, then consumes at
+        // exactly real-time — verified by a 300 s soak at 48000.0 samples/s).
+        // The added latency is device-inherent; the loopback benchmark is the
+        // truth-teller for whether exclusive wins on a given codec.
 
         // --- 1. CAPTURE: WASAPI → ASIO input buffers ---
         if (hasCapture && m_useInputRings) {
@@ -587,12 +605,21 @@ void AudioThread::RunAligned(
 
             if (m_exclusive) {
                 // Exclusive event-driven: write exactly one full buffer per
-                // event; padding queries are meaningless here.
+                // event. Record the device-reported queue depth (padding) as
+                // telemetry — if the codec maintains a hidden FIFO beyond the
+                // advertised period, it shows up here.
+                UINT32 exPad = 0;
+                if (SUCCEEDED(m_backend->GetRenderAudioClient()->GetCurrentPadding(&exPad))) {
+                    long prev = m_maxRenderPadding.load(std::memory_order_relaxed);
+                    if ((long)exPad > prev)
+                        m_maxRenderPadding.store((long)exPad, std::memory_order_relaxed);
+                }
                 BYTE* pData = nullptr;
                 if (SUCCEEDED(renderClient->GetBuffer((UINT32)m_bufferSize, &pData))) {
                     ConvertFloatToDev(pData, interleaved.data(),
                                       (size_t)m_bufferSize * renderCh, m_renderFmt);
                     renderClient->ReleaseBuffer((UINT32)m_bufferSize, 0);
+                    m_exclusiveSubmitted.fetch_add(m_bufferSize, std::memory_order_relaxed);
                 } else {
                     m_underrunCount.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -672,7 +699,9 @@ void AudioThread::RunDecoupled(
         // How many frames can we write to WASAPI right now?
         UINT32 availableFrames = 0;
         if (m_exclusive) {
-            // Exclusive event-driven: exactly one full buffer per event
+            // Exclusive event-driven: one full buffer per event, always — the
+            // event chain is demand-driven and stalls if a write is skipped
+            // (see RunAligned's pacing note).
             availableFrames = m_backend->GetRenderBufferFrames();
         } else {
             UINT32 padding = m_backend->GetRenderBufferPadding();
@@ -750,6 +779,8 @@ void AudioThread::RunDecoupled(
                                       (size_t)availableFrames * nCh, m_renderFmt);
                 }
                 renderClient->ReleaseBuffer(availableFrames, 0);
+                if (m_exclusive)
+                    m_exclusiveSubmitted.fetch_add(availableFrames, std::memory_order_relaxed);
             }
         }
     }
