@@ -1,26 +1,147 @@
 #include "audio_thread.h"
 #define NOMINMAX
 #include <avrt.h>
+#include <mmreg.h>
+#include <ks.h>
+#include <ksmedia.h>
 #include <stdio.h>
 #include <algorithm>
+
+// ============================================================================
+// Sample format helpers — the ASIO side is always float32; the device stream
+// may be int16/int24/int32 in exclusive mode.
+// ============================================================================
+
+static SampleFmt DetectSampleFormat(const WAVEFORMATEX* fmt)
+{
+    if (!fmt) return SampleFmt::F32;
+
+    bool isFloat = (fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT);
+    WORD validBits = fmt->wBitsPerSample;
+
+    if (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+        const WAVEFORMATEXTENSIBLE* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(fmt);
+        isFloat = (ext->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+        if (ext->Samples.wValidBitsPerSample)
+            validBits = ext->Samples.wValidBitsPerSample;
+    }
+
+    if (isFloat) return SampleFmt::F32;
+    if (fmt->wBitsPerSample == 16) return SampleFmt::I16;
+    if (fmt->wBitsPerSample == 32 && validBits == 24) return SampleFmt::I24_32;
+    return SampleFmt::I32;
+}
+
+// Interleaved float -> device layout, with clamping.
+static void ConvertFloatToDev(BYTE* dst, const float* src, size_t sampleCount, SampleFmt fmt)
+{
+    switch (fmt) {
+        case SampleFmt::F32:
+            memcpy(dst, src, sampleCount * sizeof(float));
+            break;
+        case SampleFmt::I16: {
+            INT16* d = reinterpret_cast<INT16*>(dst);
+            for (size_t i = 0; i < sampleCount; ++i) {
+                float v = src[i];
+                v = (v > 1.0f) ? 1.0f : (v < -1.0f) ? -1.0f : v;
+                d[i] = (INT16)(v * 32767.0f);
+            }
+            break;
+        }
+        case SampleFmt::I24_32: {
+            INT32* d = reinterpret_cast<INT32*>(dst);
+            for (size_t i = 0; i < sampleCount; ++i) {
+                float v = src[i];
+                v = (v > 1.0f) ? 1.0f : (v < -1.0f) ? -1.0f : v;
+                d[i] = ((INT32)(v * 8388607.0f)) << 8; // 24 valid bits, MSB-aligned
+            }
+            break;
+        }
+        case SampleFmt::I32: {
+            INT32* d = reinterpret_cast<INT32*>(dst);
+            for (size_t i = 0; i < sampleCount; ++i) {
+                float v = src[i];
+                v = (v > 1.0f) ? 1.0f : (v < -1.0f) ? -1.0f : v;
+                d[i] = (INT32)(v * 2147483520.0f);
+            }
+            break;
+        }
+    }
+}
+
+// One device sample -> float (used per-channel during de-interleave).
+static inline float DevSampleToFloat(const BYTE* frameBase, int channel, SampleFmt fmt)
+{
+    switch (fmt) {
+        case SampleFmt::F32:    return reinterpret_cast<const float*>(frameBase)[channel];
+        case SampleFmt::I16:    return reinterpret_cast<const INT16*>(frameBase)[channel] / 32768.0f;
+        case SampleFmt::I24_32: return (reinterpret_cast<const INT32*>(frameBase)[channel] >> 8) / 8388608.0f;
+        case SampleFmt::I32:    return reinterpret_cast<const INT32*>(frameBase)[channel] / 2147483648.0f;
+    }
+    return 0.0f;
+}
+
+// ============================================================================
+// CPU-Sets P-core pinning (Phase 5): keep the real-time threads off E-cores
+// on hybrid CPUs. On homogeneous CPUs this pins to all cores (harmless).
+// ============================================================================
+static void PinThreadToPerformanceCores(HANDLE hThread)
+{
+    ULONG len = 0;
+    GetSystemCpuSetInformation(nullptr, 0, &len, GetCurrentProcess(), 0);
+    if (len == 0) return;
+
+    std::vector<BYTE> buffer(len);
+    auto info = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data());
+    if (!GetSystemCpuSetInformation(info, len, &len, GetCurrentProcess(), 0)) return;
+
+    BYTE maxClass = 0;
+    for (ULONG off = 0; off < len;) {
+        auto e = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data() + off);
+        if (e->Type == CpuSetInformation && e->CpuSet.EfficiencyClass > maxClass)
+            maxClass = e->CpuSet.EfficiencyClass;
+        off += e->Size;
+    }
+
+    std::vector<ULONG> ids;
+    for (ULONG off = 0; off < len;) {
+        auto e = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data() + off);
+        if (e->Type == CpuSetInformation && e->CpuSet.EfficiencyClass == maxClass)
+            ids.push_back(e->CpuSet.Id);
+        off += e->Size;
+    }
+
+    if (!ids.empty())
+        SetThreadSelectedCpuSets(hThread, ids.data(), (ULONG)ids.size());
+}
+
+// ============================================================================
 
 AudioThread::AudioThread(WasapiBackend* backend)
     : m_backend(backend)
     , m_threadHandle(NULL)
     , m_eventHandle(NULL)
+    , m_asioThreadHandle(NULL)
+    , m_asioEventHandle(NULL)
     , m_stopRequested(false)
     , m_bufferSize(0)
     , m_wasapiPeriod(0)
     , m_alignedMode(false)
+    , m_exclusive(false)
+    , m_useInputRings(false)
     , m_callbacks(nullptr)
-    , m_bufferInfos(nullptr)
-    , m_numInputChannels(0)
-    , m_numOutputChannels(0)
+    , m_sampleRate(48000.0)
+    , m_timeInfoMode(false)
+    , m_renderFmt(SampleFmt::F32)
+    , m_captureFmt(SampleFmt::F32)
     , m_asioBufferIndex(0)
+    , m_samplePosition(0)
+    , m_systemTimeNs(0)
+    , m_carryFrames(0)
     , m_underrunCount(0)
-    , m_asioThreadHandle(NULL)
-    , m_asioEventHandle(NULL)
 {
+    memset(&m_asioTime, 0, sizeof(m_asioTime));
+    QueryPerformanceFrequency(&m_qpcFreq);
 }
 
 AudioThread::~AudioThread()
@@ -28,21 +149,62 @@ AudioThread::~AudioThread()
     Stop();
 }
 
-bool AudioThread::Start(long bufferSize, ASIOCallbacks* callbacks, ASIOBufferInfo* bufferInfos, long numInputChannels, long numOutputChannels)
+void AudioThread::ComputeLatencies(long asioBufferSize, long wasapiPeriod, bool alignedMode,
+                                   long inflightFrames, long capturePeriodFrames,
+                                   long& inputLatency, long& outputLatency)
 {
-    m_bufferSize         = bufferSize;
-    m_callbacks          = callbacks;
-    m_bufferInfos        = bufferInfos;
-    m_numInputChannels   = numInputChannels;
-    m_numOutputChannels  = numOutputChannels;
-    m_asioBufferIndex    = 0;
-    m_stopRequested      = false;
-    m_underrunCount      = 0;
+    if (alignedMode) {
+        // Aligned mode writes exactly one block per event, so the endpoint
+        // buffer never holds more than ~one block + one period in flight.
+        // With capture on its own cadence (exclusive render), input is
+        // smoothed through a ring adding one capture period.
+        inputLatency  = (capturePeriodFrames > 0) ? capturePeriodFrames + asioBufferSize
+                                                  : wasapiPeriod;
+        outputLatency = asioBufferSize + wasapiPeriod;
+    } else {
+        // Decoupled mode: output-ring prefill depth + the endpoint buffer,
+        // which the engine keeps topped up (primed with silence at start).
+        // The ring must survive the longest gap in ASIO production: the
+        // capture packet interval when input arrives in coarser bursts than
+        // the render period (e.g. exclusive render at 144 frames + shared mic
+        // at 480). Prefill = period + max(period, capture cadence) + block.
+        // Must match Start() prefill and RunAsioThread's targetDepth.
+        long gap = (capturePeriodFrames > wasapiPeriod) ? capturePeriodFrames : wasapiPeriod;
+        long prefill = wasapiPeriod + gap + asioBufferSize;
+        inputLatency  = asioBufferSize + gap;
+        outputLatency = prefill + inflightFrames;
+    }
+}
+
+bool AudioThread::Start(long bufferSize, ASIOCallbacks* callbacks,
+                        std::vector<ChannelSlot> inputSlots,
+                        std::vector<ChannelSlot> outputSlots,
+                        double sampleRate, bool timeInfoMode)
+{
+    m_bufferSize       = bufferSize;
+    m_callbacks        = callbacks;
+    m_inputSlots       = std::move(inputSlots);
+    m_outputSlots      = std::move(outputSlots);
+    m_sampleRate       = sampleRate;
+    m_timeInfoMode     = timeInfoMode;
+    m_asioBufferIndex  = 0;
+    m_stopRequested    = false;
+    m_underrunCount    = 0;
+    m_wakeupCount      = 0;
+    m_getBufferFailCount = 0;
+    m_minRingDepth     = -1;
+    m_samplePosition   = 0;
+    m_systemTimeNs     = 0;
+    m_carryFrames      = 0;
+
+    memset(&m_asioTime, 0, sizeof(m_asioTime));
+    m_asioTime.timeInfo.speed = 1.0;
+    m_asioTime.timeInfo.sampleRate = m_sampleRate;
 
     m_eventHandle = CreateEvent(NULL, FALSE, FALSE, NULL);
     if (!m_eventHandle) return false;
 
-    // Negotiate the WASAPI period. InitStreams will set m_alignedMode.
+    // Negotiate the stream period. InitStreams will set m_alignedMode.
     bool aligned = false;
     if (!m_backend->InitStreams(m_bufferSize, m_eventHandle, aligned)) {
         CloseHandle(m_eventHandle);
@@ -50,33 +212,61 @@ bool AudioThread::Start(long bufferSize, ASIOCallbacks* callbacks, ASIOBufferInf
         return false;
     }
 
-    m_alignedMode    = aligned;
-    m_wasapiPeriod   = m_backend->GetNegotiatedPeriod();
+    m_alignedMode  = aligned;
+    m_wasapiPeriod = m_backend->GetNegotiatedPeriod();
+    m_exclusive    = m_backend->IsExclusive();
+    m_renderFmt    = DetectSampleFormat(m_backend->GetRenderStreamFormat());
+    m_captureFmt   = DetectSampleFormat(m_backend->GetCaptureFormat());
 
-    // Allocate ring buffers for fallback mode only.
-    // In aligned mode we skip them entirely — zero allocation overhead.
-    if (!m_alignedMode) {
-        // Size the ring to hold at least 4x the larger of the two periods to absorb jitter.
-        size_t ringSize = (size_t)((std::max)(m_wasapiPeriod, m_bufferSize)) * 8;
-        if (ringSize < 16384) ringSize = 16384;
+    // With an exclusive render stream, capture stays shared and runs at its
+    // own (usually longer) period — smooth it through input rings even in
+    // aligned mode so the DAW gets contiguous input.
+    m_useInputRings = (!m_alignedMode) ||
+                      (m_exclusive && !m_inputSlots.empty() && m_backend->GetCaptureClient());
 
-        for (int i = 0; i < m_numInputChannels; ++i)
-            m_inputRings.push_back(new RingBuffer(ringSize));
+    // Capture cadence: how coarsely input actually arrives. Drives the input
+    // smoothing prefill and, in decoupled mode, the output-ring depth (the
+    // ASIO thread can stall for a whole capture interval waiting for input).
+    long captureCadence = 0;
+    const bool haveCaptureStream = !m_inputSlots.empty() && m_backend->GetCaptureClient();
+    if (haveCaptureStream)
+        captureCadence = m_backend->GetCaptureStreamPeriod();
 
-        for (int i = 0; i < m_numOutputChannels; ++i) {
+    long capturePeriod = 0; // 0 = capture follows the render cadence (no ring smoothing)
+    if (m_alignedMode && m_useInputRings)
+        capturePeriod = captureCadence > 0 ? captureCadence : m_backend->GetCaptureDefaultPeriodFrames();
+
+    long depthGap = (captureCadence > m_wasapiPeriod) ? captureCadence : m_wasapiPeriod;
+    m_targetDepth = (size_t)m_wasapiPeriod + (size_t)depthGap + (size_t)m_bufferSize;
+
+    // Allocate ring buffers as needed.
+    size_t ringSize = (size_t)((std::max)((long)m_targetDepth, (std::max)(m_wasapiPeriod, m_bufferSize))) * 8;
+    if (ringSize < 16384) ringSize = 16384;
+
+    if (m_useInputRings) {
+        for (size_t i = 0; i < m_inputSlots.size(); ++i) {
             auto rb = new RingBuffer(ringSize);
-            // Pre-fill output ring to the target depth so we start safely ahead of WASAPI.
-            size_t prefill = (size_t)(m_bufferSize * 2);
-            if (prefill < (size_t)m_wasapiPeriod * 4) prefill = (size_t)m_wasapiPeriod * 4;
-            rb->PushSilence(prefill);
+            // Cadence-smoothing prefill so processing starts immediately
+            // instead of stalling until the first capture burst arrives.
+            if (captureCadence > 0)
+                rb->PushSilence((size_t)captureCadence);
+            m_inputRings.push_back(rb);
+        }
+    }
+
+    if (!m_alignedMode) {
+        for (size_t i = 0; i < m_outputSlots.size(); ++i) {
+            auto rb = new RingBuffer(ringSize);
+            // Pre-fill output ring to the target depth so we start safely ahead
+            // of WASAPI. Must match ComputeLatencies and RunAsioThread.
+            rb->PushSilence(m_targetDepth);
             m_outputRings.push_back(rb);
         }
     }
 
     m_threadHandle = CreateThread(NULL, 0, ThreadProc, this, 0, NULL);
     if (!m_threadHandle) {
-        CloseHandle(m_eventHandle);
-        m_eventHandle = NULL;
+        Stop();
         return false;
     }
 
@@ -93,9 +283,29 @@ bool AudioThread::Start(long bufferSize, ASIOCallbacks* callbacks, ASIOBufferInf
             return false;
         }
         SetThreadPriority(m_asioThreadHandle, THREAD_PRIORITY_TIME_CRITICAL);
+        PinThreadToPerformanceCores(m_asioThreadHandle);
     }
 
     SetThreadPriority(m_threadHandle, THREAD_PRIORITY_TIME_CRITICAL);
+    PinThreadToPerformanceCores(m_threadHandle);
+
+    // Decoupled mode keeps the endpoint buffer topped up; prime it with
+    // silence so the first event doesn't offer the whole empty buffer at once.
+    // Aligned shared mode must NOT be primed (it writes one block per event; a
+    // full buffer would permanently add bufFrames of latency). Exclusive
+    // event-driven streams must always be primed before Start.
+    if (!m_alignedMode || m_exclusive) {
+        m_backend->PrimeRenderWithSilence();
+    }
+
+    // Publish the actual latencies of this configuration
+    long inflight = (long)m_backend->GetRenderBufferFrames();
+    if (inflight <= 0) inflight = m_wasapiPeriod * 2;
+    if (m_exclusive) inflight *= 2; // exclusive event-driven double-buffers internally
+    long capForLatency = m_alignedMode ? capturePeriod : captureCadence;
+    ComputeLatencies(m_bufferSize, m_wasapiPeriod, m_alignedMode, inflight, capForLatency,
+                     m_actualInputLatency, m_actualOutputLatency);
+    m_latenciesValid.store(true, std::memory_order_release);
 
     if (!m_backend->Start()) {
         Stop();
@@ -104,9 +314,10 @@ bool AudioThread::Start(long bufferSize, ASIOCallbacks* callbacks, ASIOBufferInf
 
     char dbgMsg[256];
     sprintf_s(dbgMsg,
-        "[LuxASIO] AudioThread started. ASIO=%ld, WASAPI=%ld, mode=%s\n",
+        "[LuxASIO] AudioThread started. ASIO=%ld, stream=%ld, %s %s, timeInfo=%d\n",
         m_bufferSize, m_wasapiPeriod,
-        m_alignedMode ? "ALIGNED" : "FALLBACK-RING");
+        m_exclusive ? "EXCLUSIVE" : "SHARED",
+        m_alignedMode ? "ALIGNED" : "FALLBACK-RING", m_timeInfoMode ? 1 : 0);
     OutputDebugStringA(dbgMsg);
 
     return true;
@@ -114,6 +325,7 @@ bool AudioThread::Start(long bufferSize, ASIOCallbacks* callbacks, ASIOBufferInf
 
 void AudioThread::Stop()
 {
+    m_latenciesValid.store(false, std::memory_order_release);
     m_stopRequested = true;
     if (m_eventHandle)
         SetEvent(m_eventHandle);
@@ -150,19 +362,25 @@ void AudioThread::Stop()
     for (auto rb : m_outputRings) delete rb;
     m_inputRings.clear();
     m_outputRings.clear();
+    m_inputSlots.clear();
+    m_outputSlots.clear();
 }
 
 DWORD WINAPI AudioThread::ThreadProc(LPVOID lpParam)
 {
     AudioThread* self = static_cast<AudioThread*>(lpParam);
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
     self->Run();
+    CoUninitialize();
     return 0;
 }
 
 DWORD WINAPI AudioThread::AsioThreadProc(LPVOID lpParam)
 {
     AudioThread* self = static_cast<AudioThread*>(lpParam);
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
     self->RunAsioThread();
+    CoUninitialize();
     return 0;
 }
 
@@ -170,10 +388,12 @@ void AudioThread::Run()
 {
     DWORD taskIndex = 0;
     HANDLE mmcssHandle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+    if (mmcssHandle)
+        AvSetMmThreadPriority(mmcssHandle, AVRT_PRIORITY_CRITICAL);
 
     auto renderClient  = m_backend->GetRenderClient();
     auto captureClient = m_backend->GetCaptureClient();
-    auto renderFormat  = m_backend->GetRenderFormat();
+    auto renderFormat  = m_backend->GetRenderStreamFormat();
     auto captureFormat = m_backend->GetCaptureFormat();
 
     if (m_alignedMode)
@@ -185,10 +405,75 @@ void AudioThread::Run()
         AvRevertMmThreadCharacteristics(mmcssHandle);
 }
 
+void AudioThread::InvokeBufferSwitch()
+{
+    LARGE_INTEGER qpc;
+    QueryPerformanceCounter(&qpc);
+    long long ns = (long long)((double)qpc.QuadPart / (double)m_qpcFreq.QuadPart * 1e9);
+    m_systemTimeNs.store(ns, std::memory_order_relaxed);
+
+    long long pos = m_samplePosition.load(std::memory_order_relaxed);
+
+    if (m_timeInfoMode && m_callbacks && m_callbacks->bufferSwitchTimeInfo) {
+        AsioTimeInfo& ti = m_asioTime.timeInfo;
+        ti.speed = 1.0;
+        ti.sampleRate = m_sampleRate;
+        ti.samplePosition.hi = (unsigned long)((unsigned long long)pos >> 32);
+        ti.samplePosition.lo = (unsigned long)((unsigned long long)pos & 0xFFFFFFFFull);
+        ti.systemTime.hi = (unsigned long)((unsigned long long)ns >> 32);
+        ti.systemTime.lo = (unsigned long)((unsigned long long)ns & 0xFFFFFFFFull);
+        ti.flags = kSystemTimeValid | kSamplePositionValid | kSampleRateValid;
+        m_callbacks->bufferSwitchTimeInfo(&m_asioTime, m_asioBufferIndex, ASIOFalse);
+    } else if (m_callbacks && m_callbacks->bufferSwitch) {
+        m_callbacks->bufferSwitch(m_asioBufferIndex, ASIOFalse);
+    }
+
+    m_samplePosition.store(pos + m_bufferSize, std::memory_order_relaxed);
+    m_asioBufferIndex = m_asioBufferIndex == 0 ? 1 : 0;
+}
+
+void AudioThread::DrainCaptureToRings(ComPtr<IAudioCaptureClient>& captureClient,
+                                      WAVEFORMATEX* captureFormat,
+                                      std::vector<float>& scratch)
+{
+    UINT32 packetLength = 0;
+    HRESULT hr = captureClient->GetNextPacketSize(&packetLength);
+    while (SUCCEEDED(hr) && packetLength > 0) {
+        BYTE* pData = nullptr; DWORD flags = 0; UINT32 framesAvail = 0;
+        hr = captureClient->GetBuffer(&pData, &framesAvail, &flags, nullptr, nullptr);
+        if (SUCCEEDED(hr)) {
+            if (scratch.size() < framesAvail)
+                scratch.resize((size_t)framesAvail * 2);
+
+            // Push the same amount to every ring so channels stay in phase
+            size_t minWrite = framesAvail;
+            for (auto rb : m_inputRings)
+                minWrite = (std::min)(minWrite, rb->GetAvailableWrite());
+
+            if (minWrite > 0) {
+                const bool isSilent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+                const int nCh = captureFormat->nChannels;
+                const size_t frameBytes = captureFormat->nBlockAlign;
+                for (size_t s = 0; s < m_inputSlots.size(); ++s) {
+                    long ch = m_inputSlots[s].deviceChannel;
+                    if (isSilent || ch >= nCh) {
+                        m_inputRings[s]->PushSilence(minWrite);
+                    } else {
+                        for (size_t f = 0; f < minWrite; ++f)
+                            scratch[f] = DevSampleToFloat(pData + f * frameBytes, ch, m_captureFmt);
+                        m_inputRings[s]->Push(scratch.data(), minWrite);
+                    }
+                }
+            }
+            captureClient->ReleaseBuffer(framesAvail);
+        }
+        hr = captureClient->GetNextPacketSize(&packetLength);
+    }
+}
+
 // =============================================================================
 // ALIGNED MODE — zero-overhead direct passthrough
-// WASAPI period == ASIO buffer size. Every WASAPI event is exactly one ASIO block.
-// No ring buffers, no starvation, no drift. Identical stability to Steinberg's driver.
+// Stream period == ASIO buffer size. Every event is exactly one ASIO block.
 // =============================================================================
 void AudioThread::RunAligned(
     ComPtr<IAudioRenderClient>& renderClient,
@@ -196,20 +481,40 @@ void AudioThread::RunAligned(
     WAVEFORMATEX* renderFormat,
     WAVEFORMATEX* captureFormat)
 {
-    const bool hasCapture  = (captureClient && captureFormat && m_numInputChannels > 0);
-    const bool hasRender   = (renderClient  && renderFormat  && m_numOutputChannels > 0);
+    const bool hasCapture  = (captureClient && captureFormat && !m_inputSlots.empty());
+    const bool hasRender   = (renderClient  && renderFormat  && !m_outputSlots.empty());
+    const int renderCh     = renderFormat ? renderFormat->nChannels : 2;
+    const size_t devSampleBytes = renderFormat ? (renderFormat->wBitsPerSample / 8) : 4;
 
-    // Scratch buffers for interleave/deinterleave — allocated once, outside the loop
-    std::vector<float> captureDeinterleaved(m_bufferSize);
-    std::vector<float> renderInterleaved(m_bufferSize * (renderFormat ? renderFormat->nChannels : 2));
+    // Interleave scratch for one ASIO block at the device channel count.
+    std::vector<float> interleaved((size_t)m_bufferSize * renderCh, 0.0f);
+    std::vector<float> captureScratch(16384);
+    // Carry holds frames WASAPI couldn't take yet (bounded: one block).
+    m_renderCarry.assign((size_t)m_bufferSize * renderCh, 0.0f);
+    m_carryFrames = 0;
 
     while (!m_stopRequested) {
         DWORD waitResult = WaitForSingleObject(m_eventHandle, 2000);
         if (m_stopRequested) break;
         if (waitResult != WAIT_OBJECT_0) continue;
 
-        // --- 1. CAPTURE: WASAPI → ASIO input buffers (de-interleave) ---
-        if (hasCapture) {
+        // --- 1. CAPTURE: WASAPI → ASIO input buffers ---
+        if (hasCapture && m_useInputRings) {
+            // Capture runs on its own cadence (exclusive render): smooth via rings
+            DrainCaptureToRings(captureClient, captureFormat, captureScratch);
+            bool haveBlock = !m_inputRings.empty();
+            for (auto rb : m_inputRings)
+                if (rb->GetAvailableRead() < (size_t)m_bufferSize) { haveBlock = false; break; }
+            if (haveBlock) {
+                for (size_t s = 0; s < m_inputSlots.size(); ++s)
+                    m_inputRings[s]->Pop(m_inputSlots[s].buffers[m_asioBufferIndex], m_bufferSize);
+            } else {
+                for (auto& slot : m_inputSlots)
+                    memset(slot.buffers[m_asioBufferIndex], 0, m_bufferSize * sizeof(float));
+            }
+        } else if (hasCapture) {
+            // Same cadence: fill the block directly, appending across packets
+            UINT32 fill = 0;
             UINT32 packetLength = 0;
             HRESULT hr = captureClient->GetNextPacketSize(&packetLength);
             while (SUCCEEDED(hr) && packetLength > 0) {
@@ -218,68 +523,116 @@ void AudioThread::RunAligned(
                 hr = captureClient->GetBuffer(&pData, &framesAvail, &flags, nullptr, nullptr);
                 if (SUCCEEDED(hr)) {
                     const bool isSilent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
-                    if (!isSilent) {
-                        float* src = reinterpret_cast<float*>(pData);
-                        int nCh = captureFormat->nChannels;
-                        UINT32 count = (std::min)(framesAvail, (UINT32)m_bufferSize);
-                        for (int c = 0; c < m_numInputChannels && c < nCh; ++c) {
-                            float* dest = reinterpret_cast<float*>(m_bufferInfos[c].buffers[m_asioBufferIndex]);
+                    const int nCh = captureFormat->nChannels;
+                    const size_t frameBytes = captureFormat->nBlockAlign;
+                    UINT32 count = (std::min)(framesAvail, (UINT32)m_bufferSize - fill);
+                    for (auto& slot : m_inputSlots) {
+                        float* dest = slot.buffers[m_asioBufferIndex] + fill;
+                        if (isSilent || slot.deviceChannel >= nCh) {
+                            memset(dest, 0, count * sizeof(float));
+                        } else {
                             for (UINT32 f = 0; f < count; ++f)
-                                dest[f] = src[f * nCh + c];
+                                dest[f] = DevSampleToFloat(pData + f * frameBytes, slot.deviceChannel, m_captureFmt);
                         }
-                    } else {
-                        for (int c = 0; c < m_numInputChannels; ++c)
-                            memset(m_bufferInfos[c].buffers[m_asioBufferIndex], 0, m_bufferSize * sizeof(float));
                     }
+                    fill += count;
                     captureClient->ReleaseBuffer(framesAvail);
                 }
                 hr = captureClient->GetNextPacketSize(&packetLength);
             }
-        } else if (m_numInputChannels > 0) {
-            // No capture device — zero the input buffers
-            for (int c = 0; c < m_numInputChannels; ++c)
-                memset(m_bufferInfos[c].buffers[m_asioBufferIndex], 0, m_bufferSize * sizeof(float));
+            // Zero any shortfall so the DAW never sees stale input
+            if (fill < (UINT32)m_bufferSize) {
+                for (auto& slot : m_inputSlots)
+                    memset(slot.buffers[m_asioBufferIndex] + fill, 0,
+                           ((UINT32)m_bufferSize - fill) * sizeof(float));
+            }
+        } else {
+            for (auto& slot : m_inputSlots)
+                memset(slot.buffers[m_asioBufferIndex], 0, m_bufferSize * sizeof(float));
         }
 
         // --- 2. DAW PROCESSING BLOCK ---
-        if (m_callbacks && m_callbacks->bufferSwitch)
-            m_callbacks->bufferSwitch(m_asioBufferIndex, ASIOFalse);
+        long blockIndex = m_asioBufferIndex; // buffers the DAW just filled
+        InvokeBufferSwitch();
 
-        // --- 3. RENDER: ASIO output buffers → WASAPI (interleave) ---
+        // --- 3. RENDER: ASIO output buffers → WASAPI (interleave + convert) ---
         if (hasRender) {
-            UINT32 padding = 0;
-            m_backend->GetRenderAudioClient()->GetCurrentPadding(&padding);
+            // Interleave the fresh block once (float, device channel count)
+            memset(interleaved.data(), 0, interleaved.size() * sizeof(float));
+            for (auto& slot : m_outputSlots) {
+                if (slot.deviceChannel >= renderCh) continue;
+                float* src = slot.buffers[blockIndex];
+                for (long f = 0; f < m_bufferSize; ++f)
+                    interleaved[(size_t)f * renderCh + slot.deviceChannel] = src[f];
+            }
 
-            UINT32 maxWASAPIFrames = 0;
-            m_backend->GetRenderAudioClient()->GetBufferSize(&maxWASAPIFrames);
-
-            UINT32 framesToWrite = (maxWASAPIFrames > padding) ? (maxWASAPIFrames - padding) : 0;
-            framesToWrite = (std::min)(framesToWrite, (UINT32)m_bufferSize);
-
-            if (framesToWrite > 0) {
+            if (m_exclusive) {
+                // Exclusive event-driven: write exactly one full buffer per
+                // event; padding queries are meaningless here.
                 BYTE* pData = nullptr;
-                HRESULT hr = renderClient->GetBuffer(framesToWrite, &pData);
-                if (SUCCEEDED(hr)) {
-                    float* dest = reinterpret_cast<float*>(pData);
-                    int nCh = renderFormat->nChannels;
-                    for (int c = 0; c < m_numOutputChannels && c < nCh; ++c) {
-                        float* src = reinterpret_cast<float*>(
-                            m_bufferInfos[m_numInputChannels + c].buffers[m_asioBufferIndex]);
-                        for (UINT32 f = 0; f < framesToWrite; ++f)
-                            dest[f * nCh + c] = src[f];
+                if (SUCCEEDED(renderClient->GetBuffer((UINT32)m_bufferSize, &pData))) {
+                    ConvertFloatToDev(pData, interleaved.data(),
+                                      (size_t)m_bufferSize * renderCh, m_renderFmt);
+                    renderClient->ReleaseBuffer((UINT32)m_bufferSize, 0);
+                } else {
+                    m_underrunCount.fetch_add(1, std::memory_order_relaxed);
+                }
+            } else {
+                UINT32 padding = 0;
+                m_backend->GetRenderAudioClient()->GetCurrentPadding(&padding);
+                UINT32 maxWASAPIFrames = 0;
+                m_backend->GetRenderAudioClient()->GetBufferSize(&maxWASAPIFrames);
+                UINT32 space = (maxWASAPIFrames > padding) ? (maxWASAPIFrames - padding) : 0;
+
+                // Flush carried-over frames from the previous block first
+                if (m_carryFrames > 0 && space > 0) {
+                    UINT32 flush = (std::min)((UINT32)m_carryFrames, space);
+                    BYTE* pData = nullptr;
+                    if (SUCCEEDED(renderClient->GetBuffer(flush, &pData))) {
+                        ConvertFloatToDev(pData, m_renderCarry.data(),
+                                          (size_t)flush * renderCh, m_renderFmt);
+                        renderClient->ReleaseBuffer(flush, 0);
+                        m_carryFrames -= flush;
+                        if (m_carryFrames > 0) {
+                            memmove(m_renderCarry.data(),
+                                    m_renderCarry.data() + (size_t)flush * renderCh,
+                                    m_carryFrames * renderCh * sizeof(float));
+                        }
+                        space -= flush;
                     }
-                    renderClient->ReleaseBuffer(framesToWrite, 0);
+                }
+
+                UINT32 toWrite = (std::min)(space, (UINT32)m_bufferSize);
+                if (toWrite > 0) {
+                    BYTE* pData = nullptr;
+                    if (SUCCEEDED(renderClient->GetBuffer(toWrite, &pData))) {
+                        ConvertFloatToDev(pData, interleaved.data(),
+                                          (size_t)toWrite * renderCh, m_renderFmt);
+                        renderClient->ReleaseBuffer(toWrite, 0);
+                    }
+                }
+
+                // Stash whatever didn't fit; it goes out first on the next event
+                UINT32 leftover = (UINT32)m_bufferSize - toWrite;
+                if (leftover > 0) {
+                    if (m_carryFrames + leftover <= (size_t)m_bufferSize) {
+                        memcpy(m_renderCarry.data() + m_carryFrames * renderCh,
+                               interleaved.data() + (size_t)toWrite * renderCh,
+                               (size_t)leftover * renderCh * sizeof(float));
+                        m_carryFrames += leftover;
+                    } else {
+                        m_underrunCount.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
             }
         }
-
-        m_asioBufferIndex = m_asioBufferIndex == 0 ? 1 : 0;
     }
 }
 
 // =============================================================================
-// FALLBACK RING-BUFFER MODE — used when WASAPI period != ASIO buffer size
-// Still uses ring buffers but with a 2× WASAPI-period pre-fill and underrun logging.
+// FALLBACK RING-BUFFER MODE — used when the stream period != ASIO buffer size
+// All rings advance in lockstep: pushes are sized to the minimum free space
+// across channels so per-channel drift is impossible.
 // =============================================================================
 void AudioThread::RunDecoupled(
     ComPtr<IAudioRenderClient>& renderClient,
@@ -287,8 +640,10 @@ void AudioThread::RunDecoupled(
     WAVEFORMATEX* renderFormat,
     WAVEFORMATEX* captureFormat)
 {
-    std::vector<float> captureDeinterleaved(16384);
+    std::vector<float> captureScratch(16384);
+    std::vector<float> renderScratch(16384);
     std::vector<float> renderInterleaved(16384);
+    const int nCh = renderFormat ? renderFormat->nChannels : 2;
 
     while (!m_stopRequested) {
         DWORD waitResult = WaitForSingleObject(m_eventHandle, 2000);
@@ -296,37 +651,27 @@ void AudioThread::RunDecoupled(
         if (waitResult != WAIT_OBJECT_0) continue;
 
         // How many frames can we write to WASAPI right now?
-        UINT32 padding = m_backend->GetRenderBufferPadding();
-        UINT32 maxWASAPIFrames = 0;
-        if (m_backend->GetRenderAudioClient())
-            m_backend->GetRenderAudioClient()->GetBufferSize(&maxWASAPIFrames);
-        UINT32 availableFrames = (maxWASAPIFrames > padding) ? (maxWASAPIFrames - padding) : 0;
+        UINT32 availableFrames = 0;
+        if (m_exclusive) {
+            // Exclusive event-driven: exactly one full buffer per event
+            availableFrames = m_backend->GetRenderBufferFrames();
+        } else {
+            UINT32 padding = m_backend->GetRenderBufferPadding();
+            UINT32 maxWASAPIFrames = 0;
+            if (m_backend->GetRenderAudioClient())
+                m_backend->GetRenderAudioClient()->GetBufferSize(&maxWASAPIFrames);
+            availableFrames = (maxWASAPIFrames > padding) ? (maxWASAPIFrames - padding) : 0;
+        }
 
-        // --- 1. CAPTURE → Input Rings ---
-        if (captureClient && captureFormat && m_numInputChannels > 0) {
-            UINT32 packetLength = 0;
-            HRESULT hr = captureClient->GetNextPacketSize(&packetLength);
-            while (SUCCEEDED(hr) && packetLength > 0) {
-                BYTE* pData = nullptr; DWORD flags = 0; UINT32 framesAvail = 0;
-                hr = captureClient->GetBuffer(&pData, &framesAvail, &flags, nullptr, nullptr);
-                if (SUCCEEDED(hr)) {
-                    if (captureDeinterleaved.size() < framesAvail)
-                        captureDeinterleaved.resize(framesAvail * 2);
-
-                    float* src = reinterpret_cast<float*>(pData);
-                    int nCh = captureFormat->nChannels;
-                    for (int c = 0; c < m_numInputChannels && c < nCh; ++c) {
-                        for (UINT32 f = 0; f < framesAvail; ++f)
-                            captureDeinterleaved[f] = src[f * nCh + c];
-                        m_inputRings[c]->Push(captureDeinterleaved.data(), framesAvail);
-                    }
-                    captureClient->ReleaseBuffer(framesAvail);
-                }
-                hr = captureClient->GetNextPacketSize(&packetLength);
-            }
-        } else if (m_numInputChannels > 0 && availableFrames > 0) {
-            for (int c = 0; c < m_numInputChannels; ++c)
-                m_inputRings[c]->PushSilence(availableFrames);
+        // --- 1. CAPTURE → Input Rings (lockstep across channels) ---
+        if (captureClient && captureFormat && !m_inputSlots.empty()) {
+            DrainCaptureToRings(captureClient, captureFormat, captureScratch);
+        } else if (!m_inputSlots.empty() && availableFrames > 0) {
+            size_t minWrite = availableFrames;
+            for (auto rb : m_inputRings)
+                minWrite = (std::min)(minWrite, rb->GetAvailableWrite());
+            for (auto rb : m_inputRings)
+                rb->PushSilence(minWrite);
         }
 
         // --- 2. Wake ASIO Thread ---
@@ -336,34 +681,54 @@ void AudioThread::RunDecoupled(
         }
 
         // --- 3. Output Rings → WASAPI (with underrun protection) ---
+        m_wakeupCount.fetch_add(1, std::memory_order_relaxed);
+        if (!m_outputRings.empty()) {
+            long depth = (long)m_outputRings[0]->GetAvailableRead();
+            long prevMin = m_minRingDepth.load(std::memory_order_relaxed);
+            if (prevMin < 0 || depth < prevMin)
+                m_minRingDepth.store(depth, std::memory_order_relaxed);
+        }
         if (availableFrames > 0 && renderClient && renderFormat) {
             BYTE* pData = nullptr;
             HRESULT hr = renderClient->GetBuffer(availableFrames, &pData);
+            if (FAILED(hr)) m_getBufferFailCount.fetch_add(1, std::memory_order_relaxed);
             if (SUCCEEDED(hr)) {
-                int nCh = renderFormat->nChannels;
-                bool underrun = (!m_outputRings.empty() &&
-                    m_outputRings[0]->GetAvailableRead() < (size_t)availableFrames);
+                // Rings advance in lockstep, but check them all for safety
+                bool underrun = false;
+                for (auto rb : m_outputRings) {
+                    if (rb->GetAvailableRead() < (size_t)availableFrames) {
+                        underrun = true;
+                        break;
+                    }
+                }
 
-                if (underrun) {
+                if (underrun || m_outputRings.empty()) {
                     // Write silence instead of garbage; count and log
-                    memset(pData, 0, availableFrames * nCh * sizeof(float));
+                    memset(pData, 0, (size_t)availableFrames * renderFormat->nBlockAlign);
                     long prev = m_underrunCount.fetch_add(1, std::memory_order_relaxed);
                     if ((prev & 0xF) == 0) { // Log every 16 underruns to avoid spam
                         char dbg[128];
-                        sprintf_s(dbg, "[LuxASIO] OUTPUT UNDERRUN #%ld (ASIO=%ld, WASAPI=%ld)\n",
+                        sprintf_s(dbg, "[LuxASIO] OUTPUT UNDERRUN #%ld (ASIO=%ld, stream=%ld)\n",
                                   prev + 1, m_bufferSize, m_wasapiPeriod);
                         OutputDebugStringA(dbg);
                     }
                 } else {
-                    if (renderInterleaved.size() < availableFrames)
-                        renderInterleaved.resize(availableFrames * 2);
+                    if (renderScratch.size() < availableFrames)
+                        renderScratch.resize((size_t)availableFrames * 2);
+                    if (renderInterleaved.size() < (size_t)availableFrames * nCh)
+                        renderInterleaved.resize((size_t)availableFrames * nCh * 2);
 
-                    float* dest = reinterpret_cast<float*>(pData);
-                    for (int c = 0; c < m_numOutputChannels && c < nCh; ++c) {
-                        m_outputRings[c]->Pop(renderInterleaved.data(), availableFrames);
+                    memset(renderInterleaved.data(), 0,
+                           (size_t)availableFrames * nCh * sizeof(float));
+                    for (size_t s = 0; s < m_outputSlots.size(); ++s) {
+                        long ch = m_outputSlots[s].deviceChannel;
+                        m_outputRings[s]->Pop(renderScratch.data(), availableFrames);
+                        if (ch >= nCh) continue;
                         for (UINT32 f = 0; f < availableFrames; ++f)
-                            dest[f * nCh + c] = renderInterleaved[f];
+                            renderInterleaved[(size_t)f * nCh + ch] = renderScratch[f];
                     }
+                    ConvertFloatToDev(pData, renderInterleaved.data(),
+                                      (size_t)availableFrames * nCh, m_renderFmt);
                 }
                 renderClient->ReleaseBuffer(availableFrames, 0);
             }
@@ -375,6 +740,8 @@ void AudioThread::RunAsioThread()
 {
     DWORD taskIndex = 0;
     HANDLE mmcssHandle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+    if (mmcssHandle)
+        AvSetMmThreadPriority(mmcssHandle, AVRT_PRIORITY_CRITICAL);
 
     while (!m_stopRequested) {
         DWORD waitResult = WaitForSingleObject(m_asioEventHandle, 2000);
@@ -383,43 +750,44 @@ void AudioThread::RunAsioThread()
 
         bool canProcess = true;
         // Since this thread is completely decoupled from WASAPI, it can safely take the time
-        // needed to render large buffers. We keep the output ring filled to targetDepth.
-        size_t targetDepth = (size_t)(m_bufferSize * 2);
-        if (targetDepth < (size_t)m_wasapiPeriod * 4) targetDepth = (size_t)m_wasapiPeriod * 4;
+        // needed to render large buffers. We keep the output ring filled to m_targetDepth,
+        // which Start() computed to match the prefill and ComputeLatencies exactly.
+        const size_t targetDepth = m_targetDepth;
 
         while (canProcess && !m_stopRequested) {
-            if (m_numOutputChannels > 0 && !m_outputRings.empty()) {
+            if (!m_outputRings.empty()) {
                 if (m_outputRings[0]->GetAvailableRead() >= targetDepth) {
                     canProcess = false; break;
                 }
-            }
-
-            if (m_numInputChannels > 0 && !m_inputRings.empty()) {
-                if (m_inputRings[0]->GetAvailableRead() < (size_t)m_bufferSize) {
-                    canProcess = false; break;
+                // All rings must have room for a full block (they move in lockstep,
+                // but verify to guarantee the all-or-nothing push below)
+                for (auto rb : m_outputRings) {
+                    if (rb->GetAvailableWrite() < (size_t)m_bufferSize) {
+                        canProcess = false; break;
+                    }
                 }
+                if (!canProcess) break;
             }
-            if (m_numOutputChannels > 0 && !m_outputRings.empty()) {
-                if (m_outputRings[0]->GetAvailableWrite() < (size_t)m_bufferSize) {
-                    canProcess = false; break;
+
+            if (!m_inputRings.empty()) {
+                for (auto rb : m_inputRings) {
+                    if (rb->GetAvailableRead() < (size_t)m_bufferSize) {
+                        canProcess = false; break;
+                    }
                 }
+                if (!canProcess) break;
             }
 
-            for (int c = 0; c < m_numInputChannels; ++c) {
-                float* dest = reinterpret_cast<float*>(m_bufferInfos[c].buffers[m_asioBufferIndex]);
-                m_inputRings[c]->Pop(dest, m_bufferSize);
+            for (size_t s = 0; s < m_inputSlots.size() && s < m_inputRings.size(); ++s) {
+                m_inputRings[s]->Pop(m_inputSlots[s].buffers[m_asioBufferIndex], m_bufferSize);
             }
 
-            if (m_callbacks && m_callbacks->bufferSwitch)
-                m_callbacks->bufferSwitch(m_asioBufferIndex, ASIOFalse);
+            long blockIndex = m_asioBufferIndex;
+            InvokeBufferSwitch();
 
-            for (int c = 0; c < m_numOutputChannels; ++c) {
-                float* src = reinterpret_cast<float*>(
-                    m_bufferInfos[m_numInputChannels + c].buffers[m_asioBufferIndex]);
-                m_outputRings[c]->Push(src, m_bufferSize);
+            for (size_t s = 0; s < m_outputSlots.size(); ++s) {
+                m_outputRings[s]->Push(m_outputSlots[s].buffers[blockIndex], m_bufferSize);
             }
-
-            m_asioBufferIndex = m_asioBufferIndex == 0 ? 1 : 0;
         }
     }
 
