@@ -269,8 +269,14 @@ static const PROPERTYKEY BenchPKEY_AudioEngine_DeviceFormat =
 // hidden device FIFO filling; steady lead == its depth. Makes NO sound.
 static bool g_probeLead = false;
 
-static int RunWasapiDirect(bool exclusive, long requestedFrames) {
-    printf("=== WASAPI-DIRECT %s%s ===\n", exclusive ? "EXCLUSIVE" : "SHARED",
+// timerMode: exclusive without EVENTCALLBACK (buffer > period, self-paced,
+// padding is documented-valid). rawMode: shared with AUDCLNT_STREAMOPTIONS_RAW
+// (bypasses APO processing; may unlock different period constraints).
+static int RunWasapiDirect(bool exclusive, long requestedFrames,
+                           bool timerMode = false, bool rawMode = false,
+                           bool commMode = false) {
+    printf("=== WASAPI-DIRECT %s%s%s%s ===\n", exclusive ? "EXCLUSIVE" : "SHARED",
+           timerMode ? "-TIMER" : "", rawMode ? "-RAW" : "",
            g_probeLead ? " (silent lead probe)" : "");
 
     ComPtr<IMMDeviceEnumerator> en;
@@ -287,11 +293,32 @@ static int RunWasapiDirect(bool exclusive, long requestedFrames) {
     // --- Render setup ------------------------------------------------------
     ComPtr<IAudioClient3> ren;
     if (FAILED(renDev->Activate(__uuidof(IAudioClient3), CLSCTX_ALL, NULL, (void**)&ren))) return 1;
+
+    if (rawMode || commMode) {
+        AudioClientProperties props = {};
+        props.cbSize = sizeof(props);
+        props.bIsOffload = FALSE;
+        props.eCategory = commMode ? AudioCategory_Communications : AudioCategory_Media;
+        props.Options = rawMode ? AUDCLNT_STREAMOPTIONS_RAW : AUDCLNT_STREAMOPTIONS_NONE;
+        HRESULT hrp = ren->SetClientProperties(&props);
+        printf("SetClientProperties(%s%s): 0x%08lX\n",
+               commMode ? "Communications" : "Media",
+               rawMode ? "+RAW" : "", (unsigned long)hrp);
+    }
+
     WAVEFORMATEX* mix = nullptr;
     ren->GetMixFormat(&mix);
     if (!mix) return 1;
     const double rate = mix->nSamplesPerSec;
     const int renCh = mix->nChannels;
+
+    // Report the shared-engine period range under the current stream options —
+    // RAW mode may expose different constraints than default mode.
+    {
+        UINT32 dP = 0, fP = 0, mnP = 0, mxP = 0;
+        if (SUCCEEDED(ren->GetSharedModeEnginePeriod(mix, &dP, &fP, &mnP, &mxP)))
+            printf("shared engine periods: min=%u default=%u fundamental=%u max=%u\n", mnP, dP, fP, mxP);
+    }
 
     WAVEFORMATEX* renFmt = mix;                 // shared: mix format (float32)
     std::vector<BYTE> exFmtStorage;
@@ -321,20 +348,24 @@ static int RunWasapiDirect(bool exclusive, long requestedFrames) {
         long minFrames = (long)((double)minP * rate / 1e7 + 0.5);
         if (streamFrames < minFrames) streamFrames = minFrames;
         REFERENCE_TIME per = (REFERENCE_TIME)(1e7 * streamFrames / rate + 0.5);
+        // Timer mode: no event flag, buffer 4x the period (padding-paced)
+        const DWORD exFlags = timerMode ? 0 : AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+        REFERENCE_TIME dur = timerMode ? per * 4 : per;
 
-        HRESULT hr = ren->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                     per, per, renFmt, NULL);
+        HRESULT hr = ren->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, exFlags,
+                                     dur, per, renFmt, NULL);
         if (hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
             UINT32 aligned = 0; ren->GetBufferSize(&aligned);
             ren.Reset();
             if (FAILED(renDev->Activate(__uuidof(IAudioClient3), CLSCTX_ALL, NULL, (void**)&ren))) return 1;
             per = (REFERENCE_TIME)(1e7 * aligned / rate + 0.5);
-            hr = ren->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                 per, per, renFmt, NULL);
+            dur = timerMode ? per * 4 : per;
+            hr = ren->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, exFlags,
+                                 dur, per, renFmt, NULL);
         }
         if (FAILED(hr)) { printf("exclusive Initialize failed 0x%08lX\n", (unsigned long)hr); return 1; }
         UINT32 actual = 0; ren->GetBufferSize(&actual);
-        streamFrames = (long)actual;
+        if (!timerMode) streamFrames = (long)actual;
     } else {
         HRESULT hr = ren->InitializeSharedAudioStream(AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                                                       (UINT32)streamFrames, mix, NULL);
@@ -359,10 +390,15 @@ static int RunWasapiDirect(bool exclusive, long requestedFrames) {
     }
 
     HANDLE renEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
-    ren->SetEventHandle(renEvent);
+    if (!timerMode) ren->SetEventHandle(renEvent);
     ComPtr<IAudioRenderClient> renSvc;
     if (FAILED(ren->GetService(IID_PPV_ARGS(&renSvc)))) return 1;
     UINT32 renBufFrames = 0; ren->GetBufferSize(&renBufFrames);
+
+    REFERENCE_TIME streamLat = 0;
+    ren->GetStreamLatency(&streamLat);
+    printf("device buffer: %u frames | GetStreamLatency: %.2f ms\n",
+           renBufFrames, streamLat / 10000.0);
 
     // --- Capture setup (always shared) -------------------------------------
     ComPtr<IAudioClient> cap;
@@ -434,21 +470,29 @@ static int RunWasapiDirect(bool exclusive, long requestedFrames) {
         ren->Start();
         double startQPC = renAnchorQPC.load();
         double lastLeadPrint = 0;
+        UINT32 lastPad = 0;
         while (!done.load() && pos < totalFrames) {
-            if (WaitForSingleObject(renEvent, 2000) != WAIT_OBJECT_0) continue;
+            if (timerMode) {
+                Sleep((DWORD)(std::max)(1.0, 500.0 * streamFrames / rate)); // half period
+            } else {
+                if (WaitForSingleObject(renEvent, 2000) != WAIT_OBJECT_0) continue;
+            }
             UINT32 want = (UINT32)streamFrames;
-            if (!exclusive) {
-                UINT32 pad = 0; ren->GetCurrentPadding(&pad);
+            if (!exclusive || timerMode) {
+                UINT32 pad = 0;
+                if (FAILED(ren->GetCurrentPadding(&pad))) break;
+                lastPad = pad;
                 want = (renBufFrames > pad) ? renBufFrames - pad : 0;
             }
-            if (want == 0) continue;
-            if (FAILED(renSvc->GetBuffer(want, &p))) continue;
-            for (UINT32 f = 0; f < want; ++f) {
-                float v = timelineSample(pos + f);
-                for (int c = 0; c < renCh; ++c) WriteSample(p, renType, f * renCh + c, v);
+            if (want > 0) {
+                if (FAILED(renSvc->GetBuffer(want, &p))) { continue; }
+                for (UINT32 f = 0; f < want; ++f) {
+                    float v = timelineSample(pos + f);
+                    for (int c = 0; c < renCh; ++c) WriteSample(p, renType, f * renCh + c, v);
+                }
+                renSvc->ReleaseBuffer(want, 0);
+                pos += want;
             }
-            renSvc->ReleaseBuffer(want, 0);
-            pos += want;
 
             if (g_probeLead) {
                 LARGE_INTEGER q; QueryPerformanceCounter(&q);
@@ -456,7 +500,8 @@ static int RunWasapiDirect(bool exclusive, long requestedFrames) {
                 if (wall - lastLeadPrint >= 0.25) {
                     lastLeadPrint = wall;
                     double lead = (pos / rate - wall) * 1000.0;
-                    printf("  t=%.2fs submitted=%lld lead=%+.2f ms\n", wall, pos, lead);
+                    printf("  t=%.2fs submitted=%lld lead=%+.2f ms padding=%u\n",
+                           wall, pos, lead, lastPad);
                 }
             }
         }
@@ -556,11 +601,14 @@ static int AsioMain(int argc, char** argv);
 int main(int argc, char** argv) {
     if (argc >= 3 && strcmp(argv[1], "--wasapi-direct") == 0) {
         CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-        bool excl = (_stricmp(argv[2], "exclusive") == 0 || _stricmp(argv[2], "excl") == 0);
+        bool excl = (_strnicmp(argv[2], "excl", 4) == 0);
+        bool timer = (_stricmp(argv[2], "excl-timer") == 0);
+        bool raw = (_stricmp(argv[2], "shared-raw") == 0 || _stricmp(argv[2], "excl-raw") == 0);
+        bool comm = (_stricmp(argv[2], "excl-comm") == 0 || _stricmp(argv[2], "shared-comm") == 0);
         long frames = (argc >= 4 && argv[3][0] != '-') ? atol(argv[3]) : 0;
         for (int i = 3; i < argc; i++)
             if (strcmp(argv[i], "--probe-lead") == 0) g_probeLead = true;
-        int rc = RunWasapiDirect(excl, frames);
+        int rc = RunWasapiDirect(excl, frames, timer, raw, comm);
         CoUninitialize();
         return rc;
     }

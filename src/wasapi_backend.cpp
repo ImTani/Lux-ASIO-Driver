@@ -613,6 +613,51 @@ bool WasapiBackend::InitStreams(long asioBufferSizeInFrames, HANDLE eventHandle,
     return true;
 }
 
+bool WasapiBackend::InitCaptureStream()
+{
+    if (!m_captureAudioClient || !m_captureFormat) return false;
+
+    if (m_streamsInitialized) {
+        if (!ActivateCaptureClient()) return false;
+    }
+
+    // Shared capture at the device default period, generous buffer; the KS
+    // render loop drains packets on its own cadence, so capture never waits
+    // on this event (dummy).
+    REFERENCE_TIME defPeriod = 0, minPeriod = 0;
+    m_captureAudioClient->GetDevicePeriod(&defPeriod, &minPeriod);
+    REFERENCE_TIME duration = defPeriod * 4;
+    if (duration <= 0) duration = 400000;
+
+    HRESULT hr = m_captureAudioClient->Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+        duration,
+        0,
+        m_captureFormat,
+        NULL);
+    if (FAILED(hr)) return false;
+
+    m_captureStreamPeriod = GetCaptureDefaultPeriodFrames();
+
+    if (!m_captureDummyEvent)
+        m_captureDummyEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (m_captureDummyEvent)
+        m_captureAudioClient->SetEventHandle(m_captureDummyEvent);
+
+    hr = m_captureAudioClient->GetService(IID_PPV_ARGS(&m_captureClient));
+    if (FAILED(hr)) return false;
+
+    m_streamsInitialized = true;
+    return true;
+}
+
+bool WasapiBackend::StartCaptureOnly()
+{
+    if (!m_captureAudioClient) return false;
+    return SUCCEEDED(m_captureAudioClient->Start());
+}
+
 bool WasapiBackend::Start()
 {
     bool success = false;

@@ -158,6 +158,8 @@ static INT_PTR CALLBACK DialogProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
 
             CheckDlgButton(hwnd, IDC_EXCLUSIVE_MODE,
                            settings.GetExclusiveMode() ? BST_CHECKED : BST_UNCHECKED);
+            CheckDlgButton(hwnd, IDC_KS_MODE,
+                           settings.GetKsMode() ? BST_CHECKED : BST_UNCHECKED);
             SetDlgItemTextW(hwnd, IDC_STATUS, g_statusText.c_str());
 
             // Populate Render Devices
@@ -227,6 +229,7 @@ static INT_PTR CALLBACK DialogProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 }
 
                 settings.SetExclusiveMode(IsDlgButtonChecked(hwnd, IDC_EXCLUSIVE_MODE) == BST_CHECKED);
+                settings.SetKsMode(IsDlgButtonChecked(hwnd, IDC_KS_MODE) == BST_CHECKED);
 
                 // Get render
                 HWND hRenderCombo = GetDlgItem(hwnd, IDC_RENDER_DEVICE);

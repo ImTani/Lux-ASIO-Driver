@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <atomic>
 #include "wasapi_backend.h"
+#include "ks_backend.h"
 #include "asiodrvr.h" // For ASIOCallbacks and ASIOTime
 #include "ring_buffer.h"
 #include <vector>
@@ -25,10 +26,14 @@ public:
     AudioThread(WasapiBackend* backend);
     ~AudioThread();
 
+    // ks != nullptr selects the kernel-streaming render backend: the KS
+    // stream must already be Open(); this engine drives its event/halves and
+    // runs capture through the WasapiBackend's capture-only stream.
     bool Start(long bufferSize, ASIOCallbacks* callbacks,
                std::vector<ChannelSlot> inputSlots,
                std::vector<ChannelSlot> outputSlots,
-               double sampleRate, bool timeInfoMode);
+               double sampleRate, bool timeInfoMode,
+               KsRenderStream* ks = nullptr);
     void Stop();
 
     // Diagnostics: number of output underruns since last Start()
@@ -66,6 +71,7 @@ public:
     // Status for the control panel indicator (valid while running).
     bool IsRunning() const { return m_threadHandle != NULL; }
     bool IsAligned() const { return m_alignedMode; }
+    bool IsKs() const { return m_ks != nullptr; }
     long GetStreamPeriod() const { return m_wasapiPeriod; }
 
 private:
@@ -93,12 +99,17 @@ private:
         WAVEFORMATEX* renderFormat,
         WAVEFORMATEX* captureFormat);
 
+    // Kernel-streaming render loop (aligned or ring-decoupled)
+    void RunKs(ComPtr<IAudioCaptureClient>& captureClient,
+               WAVEFORMATEX* captureFormat);
+
     // Drain all pending capture packets into the input rings (lockstep).
     void DrainCaptureToRings(ComPtr<IAudioCaptureClient>& captureClient,
                              WAVEFORMATEX* captureFormat,
                              std::vector<float>& scratch);
 
     WasapiBackend* m_backend;
+    KsRenderStream* m_ks = nullptr; // not owned; non-null selects KS mode
     HANDLE m_threadHandle;
     HANDLE m_eventHandle;
     HANDLE m_asioThreadHandle;

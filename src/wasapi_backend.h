@@ -65,6 +65,12 @@ public:
     // Sets outAlignedMode = true iff the stream period == asioBufferSize.
     bool InitStreams(long asioBufferSizeInFrames, HANDLE eventHandle, bool& outAlignedMode);
 
+    // KS render mode: initialize ONLY the shared capture stream (render is
+    // handled by KsRenderStream). Capture gets a dummy event; packets are
+    // drained on the KS render cadence.
+    bool InitCaptureStream();
+    bool StartCaptureOnly();
+
     bool Start();
     bool Stop();
 

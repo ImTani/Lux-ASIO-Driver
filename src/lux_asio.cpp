@@ -40,6 +40,7 @@ LuxAsioDriver::LuxAsioDriver(LPUNKNOWN pUnk, HRESULT *phr)
     , m_timeInfoMode(false)
     , m_backend(new WasapiBackend())
     , m_audioThread(new AudioThread(m_backend))
+    , m_ks(new KsRenderStream())
     , m_bufferSize(0)
     , m_numInputs(0)
     , m_numOutputs(0)
@@ -56,6 +57,7 @@ LuxAsioDriver::~LuxAsioDriver()
     stop();
     disposeBuffers();
     delete m_audioThread;
+    delete m_ks;
     delete m_backend;
 }
 
@@ -70,8 +72,13 @@ ASIOBool LuxAsioDriver::init(void* sysRef)
     // The DAW calls init() again after kAsioResetRequest, so this picks up the new value.
     m_preferredBufferSize = ClampBufferSize(settings.GetBufferSize());
 
+    m_ksRequested = settings.GetKsMode();
+    m_renderEndpointId = settings.GetRenderEndpointId();
+
+    // KS mode handles render itself; don't also open a WASAPI exclusive render.
+    const bool wantExclusive = settings.GetExclusiveMode() && !m_ksRequested;
     if (!m_backend->Init(48000, settings.GetRenderEndpointId(), settings.GetCaptureEndpointId(),
-                         settings.GetExclusiveMode())) {
+                         wantExclusive)) {
         return ASIOFalse;
     }
 
@@ -119,8 +126,22 @@ ASIOError LuxAsioDriver::start()
     long estIn = 0, estOut = 0;
     getLatencies(&estIn, &estOut);
 
+    // Kernel-streaming render: open (or re-open at a new buffer size) the
+    // raw WaveRT pin. On any failure, fall back to the WASAPI path.
+    KsRenderStream* ksToUse = nullptr;
+    if (m_ksRequested) {
+        if (m_ks->IsOpen() && m_ks->GetHalfFrames() != m_bufferSize)
+            m_ks->Close();
+        if (!m_ks->IsOpen())
+            m_ks->Open(m_renderEndpointId, m_bufferSize, (DWORD)m_backend->GetSampleRate());
+        if (m_ks->IsOpen())
+            ksToUse = m_ks;
+        else
+            OutputDebugStringA("[LuxASIO] KS mode requested but pin unavailable - falling back to WASAPI\n");
+    }
+
     if (m_audioThread->Start(m_bufferSize, m_callbacks, m_inputSlots, m_outputSlots,
-                             (double)m_sampleRate, m_timeInfoMode)) {
+                             (double)m_sampleRate, m_timeInfoMode, ksToUse)) {
         m_active = true;
 
         long actIn = 0, actOut = 0;
@@ -158,6 +179,15 @@ ASIOError LuxAsioDriver::getLatencies(long *inputLatency, long *outputLatency)
     // actual configuration differs.
     if (!m_audioThread->GetActualLatencies(inLat, outLat)) {
         long bufferSize = m_buffersCreated ? m_bufferSize : m_preferredBufferSize;
+
+        if (m_ksRequested) {
+            // KS estimate: 2 halves + typical disclosed FIFO; capture rides
+            // shared WASAPI at its default period.
+            long capP = (m_numInputs > 0) ? m_backend->GetCaptureDefaultPeriodFrames() : 0;
+            if (inputLatency)  *inputLatency  = (capP > 0) ? capP + bufferSize : bufferSize;
+            if (outputLatency) *outputLatency = bufferSize * 2 + 128;
+            return ASE_OK;
+        }
 
         long wasapiPeriod = bufferSize;
         bool aligned = false;
@@ -349,6 +379,7 @@ ASIOError LuxAsioDriver::disposeBuffers()
     if (!m_buffersCreated) return ASE_OK;
 
     stop();
+    m_ks->Close(); // release the KS pin so Windows audio returns
 
     // Free exactly the buffers we allocated — tracked in our slot lists, not
     // derived from device channel counts (the host may have activated fewer).
@@ -387,7 +418,8 @@ ASIOError LuxAsioDriver::controlPanel()
     wchar_t status[160];
     if (m_active && m_audioThread->IsRunning()) {
         swprintf_s(status, L"Running: %s %s @ %ld frames — underruns: %ld%s",
-                   exclusiveActive ? L"EXCLUSIVE" : L"SHARED",
+                   m_audioThread->IsKs() ? L"KERNEL-STREAMING"
+                   : exclusiveActive ? L"EXCLUSIVE" : L"SHARED",
                    m_audioThread->IsAligned() ? L"aligned" : L"ring-buffer",
                    m_audioThread->GetStreamPeriod(),
                    m_audioThread->GetUnderrunCount(),

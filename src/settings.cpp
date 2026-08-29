@@ -20,6 +20,7 @@ void Settings::Load()
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         m_bufferSize = ReadLong(hKey, L"BufferSize", 256);
         m_exclusiveMode = ReadLong(hKey, L"ExclusiveMode", 0) != 0;
+        m_ksMode = ReadLong(hKey, L"KsMode", 0) != 0;
         m_renderEndpointId = ReadString(hKey, L"RenderEndpointId", L"");
         m_captureEndpointId = ReadString(hKey, L"CaptureEndpointId", L"");
         RegCloseKey(hKey);
@@ -32,6 +33,7 @@ void Settings::Save()
     if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_PATH, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
         WriteLong(hKey, L"BufferSize", m_bufferSize);
         WriteLong(hKey, L"ExclusiveMode", m_exclusiveMode ? 1 : 0);
+        WriteLong(hKey, L"KsMode", m_ksMode ? 1 : 0);
         WriteString(hKey, L"RenderEndpointId", m_renderEndpointId);
         WriteString(hKey, L"CaptureEndpointId", m_captureEndpointId);
         RegCloseKey(hKey);

@@ -11,6 +11,7 @@ add_library(lux_asio SHARED
     src/lux_asio.cpp
     src/lux_asio.def
     src/wasapi_backend.cpp
+    src/ks_backend.cpp
     src/audio_thread.cpp
     src/settings.cpp
     src/control_panel.cpp
@@ -58,6 +59,7 @@ target_link_libraries(lux_asio PRIVATE
     user32
     avrt
     comctl32
+    setupapi
 )
 
 # ---------------------------------------------------------------------------
@@ -86,6 +88,10 @@ target_link_libraries(lux_probe_periods PRIVATE ole32 uuid)
 # Loopback latency benchmark (roadmap Phase 1/6): measures the REAL round-trip
 # latency of any ASIO driver via chirp emission + cross-correlation, and
 # compares it against what the driver reports.
+# KS filter probe: pin factories, offload node detection, trial pin opens
+add_executable(lux_probe_ks tools/probe_ks.cpp)
+target_link_libraries(lux_probe_ks PRIVATE setupapi)
+
 add_executable(lux_latency_bench tools/latency_bench.cpp)
 target_include_directories(lux_latency_bench PRIVATE external/asiosdk/common src)
 target_compile_definitions(lux_latency_bench PRIVATE WINDOWS=1 _WINDOWS=1 WIN32=1)

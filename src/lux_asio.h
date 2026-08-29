@@ -50,6 +50,9 @@ private:
 
     WasapiBackend* m_backend;
     AudioThread* m_audioThread;
+    KsRenderStream* m_ks;          // kernel-streaming render (opt-in)
+    bool m_ksRequested = false;
+    std::wstring m_renderEndpointId;
 
     // The channels the host actually activated in createBuffers(), honoring
     // ASIOBufferInfo::isInput/channelNum (any subset, any order).

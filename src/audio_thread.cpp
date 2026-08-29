@@ -198,8 +198,10 @@ void AudioThread::ComputeLatencies(long asioBufferSize, long wasapiPeriod, bool 
 bool AudioThread::Start(long bufferSize, ASIOCallbacks* callbacks,
                         std::vector<ChannelSlot> inputSlots,
                         std::vector<ChannelSlot> outputSlots,
-                        double sampleRate, bool timeInfoMode)
+                        double sampleRate, bool timeInfoMode,
+                        KsRenderStream* ks)
 {
+    m_ks               = ks;
     m_bufferSize       = bufferSize;
     m_callbacks        = callbacks;
     m_inputSlots       = std::move(inputSlots);
@@ -226,23 +228,42 @@ bool AudioThread::Start(long bufferSize, ASIOCallbacks* callbacks,
 
     // Negotiate the stream period. InitStreams will set m_alignedMode.
     bool aligned = false;
-    if (!m_backend->InitStreams(m_bufferSize, m_eventHandle, aligned)) {
-        CloseHandle(m_eventHandle);
-        m_eventHandle = NULL;
-        return false;
+    if (m_ks) {
+        // Kernel-streaming render: stream is already open; its half-buffer is
+        // the period. Capture (optional) rides a WASAPI capture-only stream.
+        if (!m_ks->IsOpen()) {
+            CloseHandle(m_eventHandle);
+            m_eventHandle = NULL;
+            return false;
+        }
+        m_wasapiPeriod = m_ks->GetHalfFrames();
+        aligned = (m_wasapiPeriod == m_bufferSize);
+        m_exclusive = false;
+        m_renderFmt = m_ks->IsFloat() ? SampleFmt::F32
+                    : (m_ks->GetBitsPerSample() == 16) ? SampleFmt::I16
+                    : (m_ks->GetValidBits() == 24) ? SampleFmt::I24_32
+                    : SampleFmt::I32;
+        if (!m_inputSlots.empty())
+            m_backend->InitCaptureStream(); // best-effort; inputs zero-fill on failure
+        m_captureFmt = DetectSampleFormat(m_backend->GetCaptureFormat());
+    } else {
+        if (!m_backend->InitStreams(m_bufferSize, m_eventHandle, aligned)) {
+            CloseHandle(m_eventHandle);
+            m_eventHandle = NULL;
+            return false;
+        }
+        m_wasapiPeriod = m_backend->GetNegotiatedPeriod();
+        m_exclusive    = m_backend->IsExclusive();
+        m_renderFmt    = DetectSampleFormat(m_backend->GetRenderStreamFormat());
+        m_captureFmt   = DetectSampleFormat(m_backend->GetCaptureFormat());
     }
+    m_alignedMode = aligned;
 
-    m_alignedMode  = aligned;
-    m_wasapiPeriod = m_backend->GetNegotiatedPeriod();
-    m_exclusive    = m_backend->IsExclusive();
-    m_renderFmt    = DetectSampleFormat(m_backend->GetRenderStreamFormat());
-    m_captureFmt   = DetectSampleFormat(m_backend->GetCaptureFormat());
-
-    // With an exclusive render stream, capture stays shared and runs at its
-    // own (usually longer) period — smooth it through input rings even in
+    // With an exclusive or KS render stream, capture stays shared and runs at
+    // its own (usually longer) period — smooth it through input rings even in
     // aligned mode so the DAW gets contiguous input.
     m_useInputRings = (!m_alignedMode) ||
-                      (m_exclusive && !m_inputSlots.empty() && m_backend->GetCaptureClient());
+                      ((m_exclusive || m_ks) && !m_inputSlots.empty() && m_backend->GetCaptureClient());
 
     // Capture cadence: how coarsely input actually arrives. Drives the input
     // smoothing prefill and, in decoupled mode, the output-ring depth (the
@@ -318,7 +339,7 @@ bool AudioThread::Start(long bufferSize, ASIOCallbacks* callbacks,
     m_lastExclusiveWriteQpc = 0; // first event always passes the interval gate
     m_exclusiveMinIntervalQpc =
         (long long)((double)m_qpcFreq.QuadPart * m_wasapiPeriod * 0.75 / m_sampleRate);
-    if (!m_alignedMode || m_exclusive) {
+    if (!m_ks && (!m_alignedMode || m_exclusive)) {
         m_backend->PrimeRenderWithSilence();
         if (m_exclusive)
             m_exclusiveSubmitted.store((long long)m_backend->GetRenderBufferFrames(),
@@ -326,18 +347,35 @@ bool AudioThread::Start(long bufferSize, ASIOCallbacks* callbacks,
     }
 
     // Publish the actual latencies of this configuration
-    long inflight = (long)m_backend->GetRenderBufferFrames();
-    if (inflight <= 0) inflight = m_wasapiPeriod * 2;
-    if (m_exclusive) inflight *= 2; // exclusive event-driven double-buffers internally
+    long inflight;
+    if (m_ks) {
+        // KS: two halves in flight plus the driver-disclosed downstream FIFO
+        inflight = m_wasapiPeriod * 2 + m_ks->GetFifoFrames();
+    } else {
+        inflight = (long)m_backend->GetRenderBufferFrames();
+        if (inflight <= 0) inflight = m_wasapiPeriod * 2;
+        if (m_exclusive) inflight *= 2; // exclusive event-driven double-buffers internally
+    }
     long capForLatency = m_alignedMode ? capturePeriod : captureCadence;
     ComputeLatencies(m_bufferSize, m_wasapiPeriod, m_alignedMode, inflight, capForLatency,
                      m_actualInputLatency, m_actualOutputLatency);
+    if (m_ks && m_alignedMode) {
+        // Aligned model assumed one period in flight; KS has 2 halves + FIFO
+        m_actualOutputLatency = m_bufferSize + m_wasapiPeriod + m_ks->GetFifoFrames();
+    }
     m_assumedInflight = m_alignedMode ? m_wasapiPeriod : inflight;
     m_leadMeasured = false;
     m_streamStartQpc = 0;
     m_latenciesValid.store(true, std::memory_order_release);
 
-    if (!m_backend->Start()) {
+    if (m_ks) {
+        if (!m_inputSlots.empty())
+            m_backend->StartCaptureOnly(); // best-effort
+        if (!m_ks->Start()) {
+            Stop();
+            return false;
+        }
+    } else if (!m_backend->Start()) {
         Stop();
         return false;
     }
@@ -364,6 +402,9 @@ void AudioThread::Stop()
     if (m_eventHandle)
         SetEvent(m_eventHandle);
 
+    if (m_ks && m_ks->GetNotificationEvent())
+        SetEvent(m_ks->GetNotificationEvent()); // wake the KS loop
+
     if (m_asioEventHandle)
         SetEvent(m_asioEventHandle);
 
@@ -378,6 +419,9 @@ void AudioThread::Stop()
         CloseHandle(m_asioThreadHandle);
         m_asioThreadHandle = NULL;
     }
+
+    if (m_ks)
+        m_ks->Stop();
 
     if (m_backend)
         m_backend->Stop();
@@ -398,6 +442,7 @@ void AudioThread::Stop()
     m_outputRings.clear();
     m_inputSlots.clear();
     m_outputSlots.clear();
+    m_ks = nullptr; // not owned; driver re-passes it on the next Start
 }
 
 DWORD WINAPI AudioThread::ThreadProc(LPVOID lpParam)
@@ -430,7 +475,9 @@ void AudioThread::Run()
     auto renderFormat  = m_backend->GetRenderStreamFormat();
     auto captureFormat = m_backend->GetCaptureFormat();
 
-    if (m_alignedMode)
+    if (m_ks)
+        RunKs(captureClient, captureFormat);
+    else if (m_alignedMode)
         RunAligned(renderClient, captureClient, renderFormat, captureFormat);
     else
         RunDecoupled(renderClient, captureClient, renderFormat, captureFormat);
@@ -849,6 +896,110 @@ void AudioThread::RunDecoupled(
                     MaybeMeasureExclusiveLead();
                 }
             }
+        }
+    }
+}
+
+// =============================================================================
+// KERNEL-STREAMING RENDER — writes ASIO blocks straight into the WaveRT
+// cyclic buffer's halves, paced by the driver's half-boundary notification.
+// Bypasses the audio engine and the vendor DSP deep-buffer pipeline entirely.
+// =============================================================================
+void AudioThread::RunKs(ComPtr<IAudioCaptureClient>& captureClient,
+                        WAVEFORMATEX* captureFormat)
+{
+    const bool hasCapture = (captureClient && captureFormat && !m_inputSlots.empty());
+    const int ch = m_ks->GetChannels();
+    const long half = m_ks->GetHalfFrames();
+
+    std::vector<float> interleaved((size_t)half * ch, 0.0f);
+    std::vector<float> captureScratch(16384);
+    std::vector<float> popScratch((size_t)half, 0.0f);
+
+    // Watchdog: KS notifications can die like exclusive events do; recover
+    // with a pin state cycle.
+    const DWORD waitMs = (DWORD)(std::max)(50.0, 8000.0 * half / m_sampleRate);
+
+    while (!m_stopRequested) {
+        DWORD wr = WaitForSingleObject(m_ks->GetNotificationEvent(), waitMs);
+        if (m_stopRequested) break;
+        if (wr != WAIT_OBJECT_0) {
+            if (wr == WAIT_TIMEOUT) {
+                m_recoveryCount.fetch_add(1, std::memory_order_relaxed);
+                m_ks->Stop();
+                m_ks->Start();
+            }
+            continue;
+        }
+        m_wakeupCount.fetch_add(1, std::memory_order_relaxed);
+
+        const int fillHalf = m_ks->GetFillableHalf();
+
+        if (m_alignedMode) {
+            // One ASIO block per notification (half == ASIO buffer)
+            if (hasCapture && m_useInputRings) {
+                DrainCaptureToRings(captureClient, captureFormat, captureScratch);
+                bool haveBlock = !m_inputRings.empty();
+                for (auto rb : m_inputRings)
+                    if (rb->GetAvailableRead() < (size_t)m_bufferSize) { haveBlock = false; break; }
+                if (haveBlock) {
+                    for (size_t s = 0; s < m_inputSlots.size(); ++s)
+                        m_inputRings[s]->Pop(m_inputSlots[s].buffers[m_asioBufferIndex], m_bufferSize);
+                } else {
+                    for (auto& slot : m_inputSlots)
+                        memset(slot.buffers[m_asioBufferIndex], 0, m_bufferSize * sizeof(float));
+                }
+            } else {
+                for (auto& slot : m_inputSlots)
+                    memset(slot.buffers[m_asioBufferIndex], 0, m_bufferSize * sizeof(float));
+            }
+
+            long blockIndex = m_asioBufferIndex;
+            InvokeBufferSwitch();
+
+            memset(interleaved.data(), 0, interleaved.size() * sizeof(float));
+            for (auto& slot : m_outputSlots) {
+                if (slot.deviceChannel >= ch) continue;
+                float* src = slot.buffers[blockIndex];
+                for (long f = 0; f < half; ++f)
+                    interleaved[(size_t)f * ch + slot.deviceChannel] = src[f];
+            }
+            ConvertFloatToDev(m_ks->GetHalfPtr(fillHalf), interleaved.data(),
+                              (size_t)half * ch, m_renderFmt);
+            if (m_ks->NeedsMemoryBarrier()) MemoryBarrier();
+        } else {
+            // Ring-decoupled: the ASIO thread produces blocks; we pop one
+            // half's worth per notification.
+            if (hasCapture)
+                DrainCaptureToRings(captureClient, captureFormat, captureScratch);
+            if (m_asioEventHandle)
+                SetEvent(m_asioEventHandle);
+
+            bool underrun = m_outputRings.empty();
+            for (auto rb : m_outputRings)
+                if (rb->GetAvailableRead() < (size_t)half) { underrun = true; break; }
+
+            memset(interleaved.data(), 0, interleaved.size() * sizeof(float));
+            if (!underrun) {
+                for (size_t s = 0; s < m_outputSlots.size(); ++s) {
+                    long chn = m_outputSlots[s].deviceChannel;
+                    m_outputRings[s]->Pop(popScratch.data(), half);
+                    if (chn >= ch) continue;
+                    for (long f = 0; f < half; ++f)
+                        interleaved[(size_t)f * ch + chn] = popScratch[f];
+                }
+            } else {
+                long prev = m_underrunCount.fetch_add(1, std::memory_order_relaxed);
+                if ((prev & 0xF) == 0) {
+                    char dbg[128];
+                    sprintf_s(dbg, "[LuxASIO] KS OUTPUT UNDERRUN #%ld (ASIO=%ld, half=%ld)\n",
+                              prev + 1, m_bufferSize, half);
+                    OutputDebugStringA(dbg);
+                }
+            }
+            ConvertFloatToDev(m_ks->GetHalfPtr(fillHalf), interleaved.data(),
+                              (size_t)half * ch, m_renderFmt);
+            if (m_ks->NeedsMemoryBarrier()) MemoryBarrier();
         }
     }
 }
