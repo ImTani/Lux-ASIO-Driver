@@ -198,13 +198,24 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // --volume <pct>: set the default render endpoint volume (benchmark aid)
+    // --volume <pct> [endpoint-id]: set a render endpoint's volume
+    // (default endpoint when no id is given)
     if (argc >= 3 && strcmp(argv[1], "--volume") == 0) {
         float pct = (float)atof(argv[2]) / 100.0f;
         if (pct < 0) pct = 0; if (pct > 1.0f) pct = 1.0f;
         ComPtr<IMMDevice> device;
         ComPtr<IAudioEndpointVolume> vol;
-        if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device)) &&
+        HRESULT hrDev;
+        if (argc >= 4) {
+            int wlen = MultiByteToWideChar(CP_UTF8, 0, argv[3], -1, NULL, 0);
+            std::wstring wid((size_t)wlen, 0);
+            MultiByteToWideChar(CP_UTF8, 0, argv[3], -1, wid.data(), wlen);
+            wid.resize(wcslen(wid.c_str()));
+            hrDev = enumerator->GetDevice(wid.c_str(), &device);
+        } else {
+            hrDev = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+        }
+        if (SUCCEEDED(hrDev) &&
             SUCCEEDED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, NULL, (void**)&vol))) {
             vol->SetMasterVolumeLevelScalar(pct, NULL);
             vol->SetMute(FALSE, NULL);
