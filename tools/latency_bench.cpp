@@ -61,6 +61,15 @@ static int g_emissionsDone = 0;
 static std::vector<float> g_captured;       // mono mix of all inputs, indexed by g_streamPos
 static std::atomic<bool> g_done{false};
 
+// --hybrid-capture: bypass the driver's ASIO inputs (some, e.g. ASIO4ALL,
+// deliver silence when their kernel capture pin fails) and record via an
+// independent WASAPI mic stream with QPC anchors. Emission times are QPC
+// stamps taken when the chirp is written in the ASIO callback, so the result
+// measures submission->mic like the --wasapi-direct reference.
+static bool g_hybrid = false;
+static std::vector<double> g_emitQpc;       // seconds, per emission
+static LARGE_INTEGER g_qpfMain;
+
 // ---------------------------------------------------------------------------
 // Sample-type conversion (drivers differ: Lux=float32, FlexASIO/ASIO4ALL=int32...)
 // ---------------------------------------------------------------------------
@@ -132,6 +141,10 @@ static void ProcessBlock(long index) {
         long long pos = g_streamPos + f;
         if (g_emitRemaining == 0 && g_emissionsDone < g_emissionsWanted && pos >= g_nextEmitPos) {
             g_emitPositions.push_back(pos);
+            if (g_hybrid) {
+                LARGE_INTEGER q; QueryPerformanceCounter(&q);
+                g_emitQpc.push_back((double)q.QuadPart / g_qpfMain.QuadPart + (double)f / g_sampleRate);
+            }
             g_emitRemaining = (long)g_chirp.size();
             g_emitOffset = 0;
             g_emissionsDone++;
@@ -599,7 +612,16 @@ static int AsioMain(int argc, char** argv) {
     if (g_sampleRate <= 0) g_sampleRate = 48000.0;
 
     asio->getChannels(&g_numInputs, &g_numOutputs);
-    if (g_numOutputs < 1 || g_numInputs < 1) {
+
+    // --no-input: open outputs only (diagnoses drivers like ASIO4ALL that
+    // stall the whole engine when a kernel-mode input pin fails to open)
+    QueryPerformanceFrequency(&g_qpfMain);
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--no-input") == 0) g_numInputs = 0;
+        if (strcmp(argv[i], "--hybrid-capture") == 0) g_hybrid = true;
+    }
+
+    if (g_numOutputs < 1 || (g_numInputs < 1 && !(argc > 3))) {
         printf("need at least 1 input and 1 output (have %ld in / %ld out)\n", g_numInputs, g_numOutputs);
         asio->Release();
         return 1;
@@ -668,6 +690,73 @@ static int AsioMain(int argc, char** argv) {
     printf("REPORTED: in=%ld out=%ld frames (%.2f / %.2f ms)\n",
            repIn, repOut, repIn * 1000.0 / g_sampleRate, repOut * 1000.0 / g_sampleRate);
 
+    // Independent WASAPI mic capture for --hybrid-capture mode
+    ComPtr<IAudioClient> hybCap;
+    ComPtr<IAudioCaptureClient> hybCapSvc;
+    WAVEFORMATEX* hybFmt = nullptr;
+    HANDLE hybEvent = NULL;
+    std::vector<float> hybCaptured;
+    std::atomic<long long> hybPos{0};
+    std::atomic<double> hybAnchorQPC{-1.0};
+    std::atomic<long long> hybAnchorPos{-1};
+    std::atomic<bool> hybStop{false};
+    std::thread hybThread;
+    double hybRate = 48000.0;
+
+    if (g_hybrid) {
+        ComPtr<IMMDeviceEnumerator> en;
+        ComPtr<IMMDevice> mic;
+        if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, IID_PPV_ARGS(&en))) &&
+            SUCCEEDED(en->GetDefaultAudioEndpoint(eCapture, eConsole, &mic)) &&
+            SUCCEEDED(mic->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&hybCap))) {
+            hybCap->GetMixFormat(&hybFmt);
+            if (hybFmt &&
+                SUCCEEDED(hybCap->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                             400000, 0, hybFmt, NULL))) {
+                hybEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+                hybCap->SetEventHandle(hybEvent);
+                hybCap->GetService(IID_PPV_ARGS(&hybCapSvc));
+                hybRate = hybFmt->nSamplesPerSec;
+                hybCaptured.assign((size_t)(hybRate * 15.0), 0.0f);
+                const int hc = hybFmt->nChannels;
+                hybThread = std::thread([&, hc] {
+                    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+                    hybCap->Start();
+                    while (!hybStop.load()) {
+                        if (WaitForSingleObject(hybEvent, 2000) != WAIT_OBJECT_0) continue;
+                        UINT32 pkt = 0;
+                        while (SUCCEEDED(hybCapSvc->GetNextPacketSize(&pkt)) && pkt > 0) {
+                            BYTE* d = nullptr; UINT32 fr = 0; DWORD fl = 0;
+                            UINT64 dp = 0, qp = 0;
+                            if (FAILED(hybCapSvc->GetBuffer(&d, &fr, &fl, &dp, &qp))) break;
+                            long long base = hybPos.load();
+                            if (hybAnchorPos.load() < 0 && !(fl & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR)) {
+                                hybAnchorQPC.store(qp / 1e7);
+                                hybAnchorPos.store(base);
+                            }
+                            float* s = (float*)d;
+                            for (UINT32 f = 0; f < fr && (size_t)(base + f) < hybCaptured.size(); ++f) {
+                                float acc = 0;
+                                for (int c = 0; c < hc; ++c) acc += s[f * hc + c];
+                                hybCaptured[(size_t)(base + f)] = acc / hc;
+                            }
+                            hybPos.store(base + fr);
+                            hybCapSvc->ReleaseBuffer(fr);
+                        }
+                    }
+                    hybCap->Stop();
+                    CoUninitialize();
+                });
+            } else {
+                printf("hybrid capture init failed — falling back to ASIO inputs\n");
+                g_hybrid = false;
+            }
+        } else {
+            printf("hybrid capture device unavailable — falling back to ASIO inputs\n");
+            g_hybrid = false;
+        }
+    }
+
     if (asio->start() != ASE_OK) {
         printf("start() failed\n");
         asio->disposeBuffers();
@@ -675,12 +764,77 @@ static int AsioMain(int argc, char** argv) {
         return 1;
     }
 
-    // Wait for the measurement to finish (max 12 s)
-    for (int i = 0; i < 240 && !g_done.load(); i++) Sleep(50);
+    // Wait for the measurement to finish (max 12 s). Pump messages while
+    // waiting — some drivers (ASIO4ALL) run tray/notification windows on the
+    // host thread and never start their engine without a message pump.
+    for (int i = 0; i < 240 && !g_done.load(); i++) {
+        MSG msg;
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        Sleep(50);
+    }
     asio->stop();
+    if (hybThread.joinable()) {
+        Sleep(300); // capture the tail
+        hybStop = true;
+        SetEvent(hybEvent);
+        hybThread.join();
+    }
     asio->disposeBuffers();
     asio->Release();
     if (dllModule) FreeLibrary(dllModule);
+
+    // --- Hybrid analysis: QPC-anchored, like the --wasapi-direct reference --
+    if (g_hybrid) {
+        double capA = hybAnchorQPC.load();
+        long long capA0 = hybAnchorPos.load();
+        if (capA < 0) { printf("hybrid: no capture anchor\n"); return 2; }
+
+        double tNorm = 0;
+        for (float v : g_chirp) tNorm += (double)v * v;
+
+        std::vector<double> all;
+        for (size_t i = 0; i < g_emitQpc.size(); ++i) {
+            double emitQPC = g_emitQpc[i];
+            long long sBase = capA0 + (long long)((emitQPC - capA) * hybRate);
+            long long sEnd = sBase + (long long)(hybRate * 0.45);
+            if (sBase < 0) sBase = 0;
+            if ((size_t)(sEnd + g_chirp.size()) > hybCaptured.size()) continue;
+
+            double best = 0; long long bestPos = -1;
+            for (long long lag = sBase; lag < sEnd; ++lag) {
+                double dot = 0, energy = 1e-12;
+                const float* c = hybCaptured.data() + lag;
+                for (size_t k = 0; k < g_chirp.size(); ++k) {
+                    dot += (double)c[k] * g_chirp[k];
+                    energy += (double)c[k] * c[k];
+                }
+                double s = dot / sqrt(energy * tNorm);
+                if (s > best) { best = s; bestPos = lag; }
+            }
+            if (bestPos >= 0) {
+                double rtt = (capA + (bestPos - capA0) / hybRate) - emitQPC;
+                all.push_back(rtt * 1000.0);
+                printf("  trial: corr %.3f, submission->mic %.2f ms\n", best, rtt * 1000.0);
+            }
+        }
+        std::vector<double> keep;
+        if (!all.empty()) {
+            std::vector<double> s = all;
+            std::sort(s.begin(), s.end());
+            double med = s[s.size() / 2];
+            for (double d : all) if (fabs(d - med) <= 4.0) keep.push_back(d);
+            if (keep.size() < (all.size() + 1) / 2) keep.clear();
+        }
+        if (keep.empty()) { printf("MEASURED (hybrid): no consistent chirp detected\n"); return 2; }
+        std::sort(keep.begin(), keep.end());
+        printf("MEASURED submission->mic: %.2f ms median (%zu/%d in cluster)\n",
+               keep[keep.size() / 2], keep.size(), (int)g_emitQpc.size());
+        printf("REPORTED output latency: %.2f ms\n", repOut * 1000.0 / g_sampleRate);
+        return 0;
+    }
 
     // --- Analysis: cross-correlate each emission against the capture -------
     double rms = 0;
