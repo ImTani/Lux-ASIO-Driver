@@ -169,11 +169,12 @@ int main() {
         if (!SetupDiGetDeviceInterfaceDetailW(devs, &ifd, detail, sizeof(detailBuf), NULL, NULL))
             continue;
 
-        // Only care about the Intel/Realtek HDA path for this probe
+        // Real audio buses: HDA/Intel-SST and USB-class devices
         std::wstring path = detail->DevicePath;
         for (auto& ch : path) ch = towlower(ch);
         if (path.find(L"intelaudio") == std::wstring::npos &&
-            path.find(L"hdaudio") == std::wstring::npos)
+            path.find(L"hdaudio") == std::wstring::npos &&
+            path.find(L"usb#") == std::wstring::npos)
             continue;
 
         HANDLE filter = CreateFileW(detail->DevicePath, GENERIC_READ | GENERIC_WRITE, 0, NULL,
