@@ -621,24 +621,45 @@ bool WasapiBackend::InitCaptureStream()
         if (!ActivateCaptureClient()) return false;
     }
 
-    // Shared capture at the device default period, generous buffer; the KS
-    // render loop drains packets on its own cadence, so capture never waits
-    // on this event (dummy).
-    REFERENCE_TIME defPeriod = 0, minPeriod = 0;
-    m_captureAudioClient->GetDevicePeriod(&defPeriod, &minPeriod);
-    REFERENCE_TIME duration = defPeriod * 4;
-    if (duration <= 0) duration = 400000;
+    // Low-latency capture first: negotiate the IAudioClient3 minimum shared
+    // period (2 ms on capable devices like Intel DMIC arrays). Falls back to
+    // the classic path at the default engine period for locked devices.
+    UINT32 defP = 0, funP = 0, minP = 0, maxP = 0;
+    HRESULT hr = E_FAIL;
+    if (SUCCEEDED(m_captureAudioClient->GetSharedModeEnginePeriod(
+            m_captureFormat, &defP, &funP, &minP, &maxP)) &&
+        minP > 0 && minP < defP) {
+        hr = m_captureAudioClient->InitializeSharedAudioStream(
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK, minP, m_captureFormat, NULL);
+        if (SUCCEEDED(hr)) {
+            m_captureStreamPeriod = (long)minP;
+            char dbg[96];
+            sprintf_s(dbg, "[LuxASIO] low-latency capture: %u-frame period\n", minP);
+            OutputDebugStringA(dbg);
+        } else {
+            // One-shot client consumed by the failed Initialize? It isn't —
+            // failures leave it uninitialized — but re-activate defensively.
+            ActivateCaptureClient();
+        }
+    }
 
-    HRESULT hr = m_captureAudioClient->Initialize(
-        AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-        duration,
-        0,
-        m_captureFormat,
-        NULL);
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) {
+        // Classic shared capture at the device default period, generous buffer
+        REFERENCE_TIME defPeriod = 0, minPeriod = 0;
+        m_captureAudioClient->GetDevicePeriod(&defPeriod, &minPeriod);
+        REFERENCE_TIME duration = defPeriod * 4;
+        if (duration <= 0) duration = 400000;
 
-    m_captureStreamPeriod = GetCaptureDefaultPeriodFrames();
+        hr = m_captureAudioClient->Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            duration,
+            0,
+            m_captureFormat,
+            NULL);
+        if (FAILED(hr)) return false;
+        m_captureStreamPeriod = GetCaptureDefaultPeriodFrames();
+    }
 
     if (!m_captureDummyEvent)
         m_captureDummyEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
